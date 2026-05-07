@@ -1,3 +1,19 @@
+"""Intent classification task (Phase 4 / CRIT-06).
+
+The previous version of this module shipped its own ``_PREDICTIVE_KEYWORDS`` /
+``_PREDICTIVE_PATTERNS`` tables which competed with the LLM and with the
+shared canonical detector in ``bi_platform_shared.predictive.detector``. The
+audit (CRIT-06 + CRIT-14) requires a single source of truth, so the duplicated
+predictive heuristics have been removed and replaced with the shared
+``is_predictive`` helper.
+
+The task now also natively understands the ``AMBIGUOUS`` label produced by the
+hardened classifier in ``llm_intent_client``: ambiguous outputs no longer
+cascade into ``invalid_input`` / hard rejections – they bubble up as a
+dedicated ``ambiguous`` route so the orchestrator can surface a clarification
+prompt to the user.
+"""
+
 from __future__ import annotations
 
 import json
@@ -9,8 +25,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal, TypedDict
 
+from bi_platform_shared.predictive.detector import is_predictive
+
 from reasoning_app.llm_intent_client import classify_question
-from shared.input_classifier import classify_input
 from shared.pipeline_trace import make_attempt
 from shared.stage_contract import stage_allows_progress
 
@@ -45,17 +62,24 @@ class IntentModelOutputError(IntentClassificationError):
 @dataclass(frozen=True)
 class IntentTaskConfig:
     max_retries: int
+    min_confidence: float
 
     @classmethod
     def from_env(cls) -> "IntentTaskConfig":
         raw = os.getenv("INTENT_CLASSIFICATION_MAX_RETRIES")
         if raw is None:
-            return cls(max_retries=2)
+            max_retries = 2
+        else:
+            try:
+                max_retries = int(raw)
+            except ValueError:
+                max_retries = 2
+        confidence_raw = os.getenv("INTENT_CLASSIFICATION_MIN_CONFIDENCE", "0.60")
         try:
-            parsed = int(raw)
+            min_confidence = float(confidence_raw)
         except ValueError:
-            parsed = 2
-        return cls(max_retries=max(0, min(parsed, 3)))
+            min_confidence = 0.60
+        return cls(max_retries=max(0, min(max_retries, 3)), min_confidence=max(0.0, min(1.0, min_confidence)))
 
 
 def _utc_now() -> str:
@@ -147,31 +171,11 @@ _ANALYTICAL_KEYWORDS = (
     "compare",
     "top",
     "bottom",
+    "cumulative",
+    "accumulated",
+    "running total",
 )
 
-_PREDICTIVE_KEYWORDS = (
-    "forecast",
-    "predict",
-    "prediction",
-    "projected",
-    "projection",
-    "expected",
-    "future",
-    "next",
-    "upcoming",
-)
-
-_PREDICTIVE_PATTERNS = (
-    r"\bfor\s+the\s+next\b",
-    r"\bin\s+the\s+next\b",
-    r"\bover\s+the\s+next\b",
-    r"\bnext\s+\d+\s+(day|days|week|weeks|month|months|year|years)\b",
-    r"\b(?:for|in|over)\s+the\s+next\s+\d+\s+(day|days|week|weeks|month|months|year|years)\b",
-    r"\bnext\s+(day|week|month|year)\b",
-    r"\bwhat\s+will\s+be\b",
-    r"\btrend\b.*\b(next|future|upcoming|forecast|predict)\b",
-    r"\b(next|future|upcoming|forecast|predict)\b.*\btrend\b",
-)
 
 _GROUP_BY_KEYWORDS = (
     "by",
@@ -205,7 +209,9 @@ _PREDICTIVE_LABELS = {"predictive", "forecast", "forecasting"}
 
 
 def _normalize_intent_text(text: Any) -> str:
-    return re.sub(r"\s+", " ", str(text or "").strip().lower())
+    lowered = str(text or "").strip().lower()
+    lowered = re.sub(r"[_-]+", " ", lowered)
+    return re.sub(r"\s+", " ", lowered)
 
 
 def _contains_phrase(text: str, phrase: str) -> bool:
@@ -258,32 +264,33 @@ def _detect_rule_based_analytical(text: str) -> dict[str, Any]:
 
 
 def _detect_rule_based_predictive(text: str) -> dict[str, Any]:
+    """Phase 4 / CRIT-06: delegate to the canonical shared detector.
+
+    The legacy local ``_PREDICTIVE_KEYWORDS`` / ``_PREDICTIVE_PATTERNS`` tables
+    were removed because they competed with — and routinely disagreed with —
+    the shared detector at ``bi_platform_shared.predictive.detector``. The
+    return shape is preserved for the callers that still consume it.
+    """
+
     normalized = _normalize_intent_text(text)
     if not normalized:
         return {"is_predictive": False, "matched_keywords": [], "matched_patterns": []}
-    matched_keywords = [
-        keyword
-        for keyword in _PREDICTIVE_KEYWORDS
-        if _contains_phrase(normalized, keyword)
-    ]
-    matched_patterns = [
-        pattern
-        for pattern in _PREDICTIVE_PATTERNS
-        if re.search(pattern, normalized)
-    ]
-    is_predictive = bool(matched_keywords or matched_patterns)
+    detected = bool(is_predictive(normalized))
     return {
-        "is_predictive": is_predictive,
-        "matched_keywords": matched_keywords,
-        "matched_patterns": matched_patterns,
+        "is_predictive": detected,
+        "matched_keywords": [],
+        "matched_patterns": [],
     }
 
 
 def _enforce_predictive_consistency(payload: dict[str, Any]) -> dict[str, Any]:
     normalized_question_type = _normalize_intent_text(payload.get("question_type"))
     normalized_classification = _normalize_intent_text(payload.get("classification"))
-    is_predictive = normalized_question_type in _PREDICTIVE_LABELS or normalized_classification in _PREDICTIVE_LABELS
-    if is_predictive:
+    is_predictive_payload = (
+        normalized_question_type in _PREDICTIVE_LABELS
+        or normalized_classification in _PREDICTIVE_LABELS
+    )
+    if is_predictive_payload:
         payload["classification"] = "predictive"
         payload["question_type"] = "predictive"
         payload["requires_forecast"] = True
@@ -320,6 +327,8 @@ def _extract_classifier_label(classifier_output: Any) -> tuple[str, bool]:
             return "predictive", bool(llm_explicit_flag or decision_source == "llm_explicit")
         if normalized in {"conversational", "informational", "information", "non_analytical", "non-analytical"}:
             return "conversational", bool(llm_explicit_flag or decision_source == "llm_explicit")
+        if normalized == "ambiguous":
+            return "ambiguous", bool(llm_explicit_flag or decision_source == "llm_explicit")
 
     needs_sql = classifier_output.get("needs_sql")
     if isinstance(needs_sql, bool):
@@ -358,424 +367,195 @@ def run_intent_classification(
     source: str = "text",
     transcription_status: str | None = None,
 ) -> dict:
-    """
-    Runtime wrapper for existing analytical-vs-non-analytical intent classification.
+    """Always-on LLM intent classification with fail-safe fallback.
+
+    Phase 4 / CRIT-06 contract:
+    - The classifier never raises; failures and low-confidence outputs come
+      back as ``label == AMBIGUOUS`` and are routed to a clarification step.
+    - Predictive consistency is enforced via the shared
+      ``bi_platform_shared.predictive.detector.is_predictive`` so the LLM and
+      rules agree on what a forecast question looks like.
+    - The legacy ``invalid_input`` / ``rejected`` shapes are preserved for
+      hard signals (empty text, numeric-only noise, conversational chit-chat).
     """
     logger = _get_logger()
     config = IntentTaskConfig.from_env()
-    retry_count = 0
     stage_started_at = _utc_now()
     stage_started_perf = time.perf_counter()
     attempts: list[dict[str, Any]] = []
-    normalized_cleaned_text = _normalize_intent_text(cleaned_text)
-    normalized_raw_text = _normalize_intent_text(raw_text if raw_text is not None else cleaned_text or "")
+    normalized_cleaned_text = re.sub(r"[^\S\r\n]+", " ", str(cleaned_text or "").strip())
+    _validate_cleaned_text(normalized_cleaned_text)
+    llm_started_perf = time.perf_counter()
+    classifier_output = classify_question(normalized_cleaned_text)
+    llm_duration_ms = int((time.perf_counter() - llm_started_perf) * 1000)
 
-    pre_classification = classify_input(
-        raw_text=normalized_raw_text,
-        cleaned_text=normalized_cleaned_text,
-        source=source,
-        transcription_status=transcription_status,
+    category_type = str(classifier_output.get("type", "") or classifier_output.get("label", "")).strip().upper()
+    classification = str(classifier_output.get("classification", "")).strip().lower()
+    confidence = float(classifier_output.get("confidence", 0.0) or 0.0)
+    reasoning = str(classifier_output.get("reasoning", "")).strip() or "No reasoning provided."
+
+    # Sync the deterministic predictive detector with the LLM verdict so we
+    # never disagree about whether a question is a forecast.
+    if (
+        classification not in {"predictive", "conversational", "invalid_input", "ambiguous"}
+        and is_predictive(normalized_cleaned_text)
+    ):
+        classification = "predictive"
+        category_type = "PREDICTIVE"
+
+    if classification not in {"analytical", "predictive", "conversational", "invalid_input", "ambiguous"}:
+        if category_type == "AMBIGUOUS":
+            classification = "ambiguous"
+        elif category_type == "PREDICTIVE":
+            classification = "predictive"
+        elif category_type == "ANALYTICAL":
+            classification = "analytical"
+        elif category_type == "NON_DATA":
+            classification = "conversational"
+        elif category_type == "INVALID":
+            classification = "invalid_input"
+        else:
+            classification = "ambiguous"
+            category_type = "AMBIGUOUS"
+            reasoning = "Classifier output did not contain a valid classification."
+
+    if category_type not in {"ANALYTICAL", "PREDICTIVE", "NON_DATA", "INVALID", "AMBIGUOUS"}:
+        category_type = (
+            "PREDICTIVE"
+            if classification == "predictive"
+            else (
+                "ANALYTICAL"
+                if classification == "analytical"
+                else (
+                    "AMBIGUOUS"
+                    if classification == "ambiguous"
+                    else ("INVALID" if classification == "invalid_input" else "NON_DATA")
+                )
+            )
+        )
+
+    route = (
+        "forecasting"
+        if classification == "predictive"
+        else (
+            "analytical"
+            if classification == "analytical"
+            else (
+                "ambiguous"
+                if classification == "ambiguous"
+                else ("invalid" if classification == "invalid_input" else "stop")
+            )
+        )
     )
-    _log_event(
-        logger,
-        logging.INFO,
-        "Intent pre-classification completed",
-        classification=pre_classification.get("classification"),
-        reason=pre_classification.get("reason"),
-        confidence=pre_classification.get("confidence"),
-        source=source,
-    )
+    classification_source = str(classifier_output.get("decision_source") or "llm_intent_classifier")
+    is_ambiguous = classification == "ambiguous"
+    is_rejected = classification in {"conversational", "invalid_input"}
+    is_degraded = classification_source in {"deterministic_rule_input_guard", "rule_input_guard"} and classification in {"analytical", "predictive"}
     attempts.append(
         make_attempt(
             attempt_number=1,
             input_payload={
-                "raw_text": normalized_raw_text,
+                "raw_text": raw_text,
                 "cleaned_text": normalized_cleaned_text,
                 "source": source,
                 "transcription_status": transcription_status,
             },
-            output_payload=pre_classification,
-            success=True,
+            output_payload=classifier_output,
+            success=not is_degraded,
             retry_triggered=False,
-            model_or_method_used="rule_based_input_classifier",
-            duration_ms=0,
-            validation_result={"is_valid": True},
+            model_or_method_used="llm_intent_classifier",
+            duration_ms=llm_duration_ms,
+            validation_result={
+                "is_valid": not is_rejected and not is_ambiguous,
+                "type": category_type,
+                "classification": classification,
+                "degraded": is_degraded,
+                "rejected": is_rejected,
+                "ambiguous": is_ambiguous,
+            },
         )
     )
 
-    pre_label = str(pre_classification.get("classification", "")).strip().lower()
-    pre_reason = str(pre_classification.get("reason", "")).strip().lower()
-    pre_confidence = float(pre_classification.get("confidence", 0.0) or 0.0)
-    if pre_label in _SKIP_LABELS:
-        finished_at = _utc_now()
-        return {
-            "status": "success",
-            "is_analytical": False,
-            "error_type": "none",
-            "action_taken": "stop",
-            "route": "stop",
-            "classification": pre_label or "invalid_input",
-            "classification_reason": pre_classification.get("reason", ""),
-            "confidence": float(pre_classification.get("confidence", 0.5) or 0.5),
-            "question_type": pre_label or "unknown",
-            "raw_classifier_output": pre_classification,
-            "attempts": attempts,
-            "attempts_count": len(attempts),
-            "started_at": stage_started_at,
-            "finished_at": finished_at,
-            "duration_ms": int((time.perf_counter() - stage_started_perf) * 1000),
-            "warnings": [],
-            "errors": [],
-            "debug_metadata": {
-                "route": "stop",
-                "classification_source": "rule_based_input_classifier",
-            },
-        }
-
-    rule_detection = _detect_rule_based_analytical(normalized_cleaned_text)
-    rule_based_detected = bool(rule_detection.get("is_analytical"))
-    predictive_rule_detection = _detect_rule_based_predictive(normalized_cleaned_text)
-    predictive_rule_detected = bool(predictive_rule_detection.get("is_predictive"))
-    if pre_label in _PREDICTIVE_LABELS:
-        predictive_rule_detected = True
-    if predictive_rule_detected:
-        rule_based_detected = True
     _log_event(
         logger,
         logging.INFO,
-        "Rule-based analytical detection evaluated",
-        detected=rule_based_detected,
-        matched_keywords=rule_detection.get("matched_keywords", []),
-        matched_grouping_keywords=rule_detection.get("matched_grouping_keywords", []),
+        "Intent classification completed",
+        type=category_type,
+        classification=classification,
+        confidence=confidence,
+        reasoning=reasoning,
+        route=route,
+        decision_source=classification_source,
     )
+    finished_at = _utc_now()
+    error_type = "none"
+    if is_ambiguous:
+        error_type = "ambiguous"
+    elif is_rejected:
+        error_type = "input"
 
-    attempts.append(
-        make_attempt(
-            attempt_number=len(attempts) + 1,
-            input_payload={"cleaned_text": normalized_cleaned_text},
-            output_payload={
-                "rule_based_detected": rule_based_detected,
-                "predictive_rule_detected": predictive_rule_detected,
-                "matched_keywords": rule_detection.get("matched_keywords", []),
-                "matched_predictive_keywords": predictive_rule_detection.get("matched_keywords", []),
-                "matched_grouping_keywords": rule_detection.get("matched_grouping_keywords", []),
-                "matched_patterns": rule_detection.get("matched_patterns", []),
-                "input_classifier_label": pre_label,
-            },
-            success=True,
-            retry_triggered=False,
-            model_or_method_used="rule_based_intent_detector",
-            duration_ms=0,
-            validation_result={"is_valid": True},
-        )
-    )
+    status = "success"
+    if is_ambiguous:
+        status = "ambiguous"
+    elif is_rejected:
+        status = "rejected"
+    elif is_degraded:
+        status = "degraded"
 
-    if rule_based_detected:
-        _log_intent_detection_summary(
-            logger=logger,
-            input_text=normalized_cleaned_text,
-            rule_based_detected=True,
-            llm_label="SKIPPED",
-            llm_source="rule_based",
-            final_label="analytical",
+    warnings: list[dict[str, str]] = []
+    if is_degraded:
+        warnings.append(
+            {"type": "rule_based_classifier", "message": "Rule-based classification used without LLM confirmation."}
         )
-        finished_at = _utc_now()
-        classification_label = "predictive" if predictive_rule_detected else "analytical"
-        route = "forecasting" if predictive_rule_detected else "analytical"
-        return _enforce_predictive_consistency({
-            "status": "success",
-            "is_analytical": True,
-            "error_type": "none",
-            "action_taken": "stop",
+    if is_ambiguous:
+        warnings.append(
+            {"type": "ambiguous_intent", "message": reasoning}
+        )
+
+    errors: list[dict[str, str]] = []
+    if is_rejected:
+        errors.append({"type": "classification_rejected", "message": reasoning})
+
+    return _enforce_predictive_consistency({
+        "status": status,
+        "degraded": is_degraded,
+        "is_analytical": classification in {"analytical", "predictive"},
+        "is_ambiguous": is_ambiguous,
+        "error_type": error_type,
+        "action_taken": "stop",
+        "route": route,
+        "classification": classification,
+        "classification_type": category_type,
+        "classification_reason": reasoning,
+        "confidence": max(0.0, min(1.0, confidence)),
+        "question_type": classification,
+        "requires_forecast": classification == "predictive",
+        "raw_classifier_output": classifier_output,
+        "raw_model_response": str(
+            classifier_output.get("raw_model_response")
+            or classifier_output.get("llm_raw_response")
+            or ""
+        ),
+        "evidence_tokens": list(classifier_output.get("evidence_tokens") or []),
+        "attempts": attempts,
+        "attempts_count": len(attempts),
+        "started_at": stage_started_at,
+        "finished_at": finished_at,
+        "duration_ms": int((time.perf_counter() - stage_started_perf) * 1000),
+        "warnings": warnings,
+        "errors": errors,
+        "debug_metadata": {
             "route": route,
-            "classification": classification_label,
-            "classification_reason": (
-                "rule_based_predictive_detection"
-                if predictive_rule_detected
-                else "rule_based_analytical_detection"
+            "classification_source": classification_source,
+            "type": category_type,
+            "reasoning": reasoning,
+            "raw_model_response": str(
+                classifier_output.get("raw_model_response")
+                or classifier_output.get("llm_raw_response")
+                or ""
             ),
-            "confidence": 0.95 if predictive_rule_detected else 0.92,
-            "question_type": classification_label,
-            "requires_forecast": predictive_rule_detected,
-            "raw_classifier_output": {
-                "rule_based": rule_detection,
-                "predictive_rule_based": predictive_rule_detection,
-                "input_classifier": pre_classification,
-            },
-            "attempts": attempts,
-            "attempts_count": len(attempts),
-            "started_at": stage_started_at,
-            "finished_at": finished_at,
-            "duration_ms": int((time.perf_counter() - stage_started_perf) * 1000),
-            "warnings": [],
-            "errors": [],
-            "debug_metadata": {
-                "route": route,
-                "classification_source": "rule_based_intent_detector",
-                "rule_based": rule_detection,
-                "predictive_rule_based": predictive_rule_detection,
-            },
-        })
-
-    strong_conversational_signal = (
-        pre_label == "conversational"
-        and pre_reason == "conversational_pattern_detected"
-        and pre_confidence >= 0.9
-        and _is_strong_conversational_signal(normalized_cleaned_text)
-    )
-    if strong_conversational_signal:
-        attempts.append(
-            make_attempt(
-                attempt_number=len(attempts) + 1,
-                input_payload={"cleaned_text": normalized_cleaned_text},
-                output_payload={"classification": "conversational", "reason": pre_reason},
-                success=True,
-                retry_triggered=False,
-                model_or_method_used="rule_based_conversational_guard",
-                duration_ms=0,
-                validation_result={"is_valid": True},
-            )
-        )
-        _log_intent_detection_summary(
-            logger=logger,
-            input_text=normalized_cleaned_text,
-            rule_based_detected=False,
-            llm_label="SKIPPED",
-            llm_source="rule_based_conversational_guard",
-            final_label="conversational",
-        )
-        finished_at = _utc_now()
-        return {
-            "status": "success",
-            "is_analytical": False,
-            "error_type": "none",
-            "action_taken": "stop",
-            "route": "stop",
-            "classification": "conversational",
-            "classification_reason": "rule_based_conversational_detection",
-            "confidence": max(pre_confidence, 0.9),
-            "question_type": "conversational",
-            "raw_classifier_output": pre_classification,
-            "attempts": attempts,
-            "attempts_count": len(attempts),
-            "started_at": stage_started_at,
-            "finished_at": finished_at,
-            "duration_ms": int((time.perf_counter() - stage_started_perf) * 1000),
-            "warnings": [],
-            "errors": [],
-            "debug_metadata": {
-                "route": "stop",
-                "classification_source": "rule_based_conversational_guard",
-                "input_classifier": pre_classification,
-            },
-        }
-
-    while True:
-        try:
-            _validate_cleaned_text(normalized_cleaned_text)
-            llm_started_perf = time.perf_counter()
-            classifier_output = classify_question(normalized_cleaned_text)
-            llm_label, llm_is_explicit = _extract_classifier_label(classifier_output)
-            llm_duration_ms = int((time.perf_counter() - llm_started_perf) * 1000)
-
-            if llm_is_explicit and llm_label == "conversational":
-                final_label = "conversational"
-                final_reason = "llm_explicit_conversational"
-                confidence = 0.78
-            elif llm_is_explicit and llm_label == "predictive":
-                final_label = "predictive"
-                final_reason = "llm_explicit_predictive"
-                confidence = 0.9
-            elif llm_is_explicit and llm_label == "analytical":
-                final_label = "analytical"
-                final_reason = "llm_explicit_analytical"
-                confidence = 0.86
-            else:
-                # Guardrail: avoid routing non-analytical/noise-like inputs into SQL on weak signals.
-                if llm_label == "predictive" or pre_label in _PREDICTIVE_LABELS:
-                    final_label = "predictive"
-                    final_reason = "heuristic_predictive_alignment"
-                    confidence = max(pre_confidence, 0.84)
-                elif llm_label == "conversational" and pre_label in {"conversational", "noise_input", "invalid_input"}:
-                    final_label = "conversational"
-                    final_reason = "heuristic_conversational_alignment"
-                    confidence = max(pre_confidence, 0.72)
-                elif pre_label == "analytical":
-                    final_label = "analytical"
-                    final_reason = "heuristic_analytical_alignment"
-                    confidence = max(pre_confidence, 0.72)
-                else:
-                    final_label = "conversational"
-                    final_reason = "safety_default_conversational"
-                    confidence = max(pre_confidence, 0.68)
-
-            is_analytical = final_label in {"analytical", "predictive"}
-            attempts.append(
-                make_attempt(
-                    attempt_number=len(attempts) + 1,
-                    input_payload={"cleaned_text": normalized_cleaned_text},
-                    output_payload=classifier_output,
-                    success=True,
-                    retry_triggered=False,
-                    model_or_method_used="llm_intent_classifier",
-                    duration_ms=llm_duration_ms,
-                    validation_result={
-                        "is_valid": True,
-                        "needs_sql": classifier_output.get("needs_sql"),
-                        "question_type": classifier_output.get("question_type"),
-                        "llm_label": llm_label,
-                        "llm_explicit_decision": llm_is_explicit,
-                    },
-                )
-            )
-
-            _log_intent_detection_summary(
-                logger=logger,
-                input_text=normalized_cleaned_text,
-                rule_based_detected=False,
-                llm_label=llm_label,
-                llm_source=str(classifier_output.get("decision_source") or "llm_intent_classifier"),
-                final_label=final_label,
-            )
-
-            finished_at = _utc_now()
-            return _enforce_predictive_consistency({
-                "status": "success",
-                "is_analytical": is_analytical,
-                "error_type": "none",
-                "action_taken": "stop",
-                "route": (
-                    "forecasting"
-                    if final_label == "predictive"
-                    else ("analytical" if final_label == "analytical" else "stop")
-                ),
-                "classification": final_label,
-                "classification_reason": final_reason,
-                "confidence": confidence,
-                "question_type": final_label,
-                "requires_forecast": final_label == "predictive",
-                "raw_classifier_output": classifier_output,
-                "attempts": attempts,
-                "attempts_count": len(attempts),
-                "started_at": stage_started_at,
-                "finished_at": finished_at,
-                "duration_ms": int((time.perf_counter() - stage_started_perf) * 1000),
-                "warnings": [],
-                "errors": [],
-                "debug_metadata": {
-                    "route": (
-                        "forecasting"
-                        if final_label == "predictive"
-                        else ("analytical" if final_label == "analytical" else "stop")
-                    ),
-                    "classification_source": "llm_intent_classifier",
-                    "llm_label": llm_label,
-                    "llm_explicit_decision": llm_is_explicit,
-                },
-            })
-        except Exception as exc:  # noqa: BLE001
-            error_type = classify_intent_task_error(exc)
-            action_taken = _decide_intent_action(
-                error_type=error_type,
-                retry_count=retry_count,
-                config=config,
-            )
-            attempts.append(
-                make_attempt(
-                    attempt_number=len(attempts) + 1,
-                    input_payload={"cleaned_text": normalized_cleaned_text},
-                    output_payload={},
-                    success=False,
-                    retry_triggered=action_taken == "retry",
-                    retry_reason=str(exc) if action_taken == "retry" else "",
-                    model_or_method_used="llm_intent_classifier",
-                    duration_ms=0,
-                    validation_result={"is_valid": False},
-                    error_type=error_type,
-                    error_message=str(exc),
-                )
-            )
-
-            _log_event(
-                logger,
-                logging.ERROR,
-                "Intent classification failed",
-                input_chars=len(str(normalized_cleaned_text or "")),
-                input_text_preview=str(normalized_cleaned_text or "")[:200],
-                error_type=error_type,
-                action_taken=action_taken,
-                retry_count=retry_count,
-                error=str(exc),
-            )
-
-            if action_taken == "retry":
-                retry_count += 1
-                continue
-
-            finished_at = _utc_now()
-            _log_intent_detection_summary(
-                logger=logger,
-                input_text=normalized_cleaned_text,
-                rule_based_detected=False,
-                llm_label="ERROR",
-                llm_source="llm_intent_classifier",
-                final_label=(
-                    "predictive"
-                    if pre_label in _PREDICTIVE_LABELS
-                    else ("analytical" if pre_label in {"analytical"} else "conversational")
-                ),
-            )
-            return _enforce_predictive_consistency({
-                "status": "degraded",
-                "degraded": True,
-                "degradation_reason": "intent_classification_llm_error_fallback",
-                "is_analytical": bool(pre_label in {"analytical"} or pre_label in _PREDICTIVE_LABELS),
-                "error_type": "none",
-                "action_taken": "stop",
-                "route": (
-                    "forecasting"
-                    if pre_label in _PREDICTIVE_LABELS
-                    else ("analytical" if pre_label in {"analytical"} else "stop")
-                ),
-                "classification": (
-                    "predictive"
-                    if pre_label in _PREDICTIVE_LABELS
-                    else ("analytical" if pre_label in {"analytical"} else "conversational")
-                ),
-                "classification_reason": (
-                    "safety_default_predictive_on_llm_error"
-                    if pre_label in _PREDICTIVE_LABELS
-                    else (
-                        "safety_default_analytical_on_llm_error"
-                        if pre_label in {"analytical"}
-                        else "safety_default_conversational_on_llm_error"
-                    )
-                ),
-                "confidence": max(pre_confidence, 0.68),
-                "question_type": (
-                    "predictive"
-                    if pre_label in _PREDICTIVE_LABELS
-                    else ("analytical" if pre_label in {"analytical"} else "conversational")
-                ),
-                "requires_forecast": pre_label in _PREDICTIVE_LABELS,
-                "raw_classifier_output": {},
-                "attempts": attempts,
-                "attempts_count": len(attempts),
-                "started_at": stage_started_at,
-                "finished_at": finished_at,
-                "duration_ms": int((time.perf_counter() - stage_started_perf) * 1000),
-                "warnings": [{"type": error_type, "message": str(exc)}],
-                "errors": [],
-                "debug_metadata": {
-                    "route": (
-                        "forecasting"
-                        if pre_label in _PREDICTIVE_LABELS
-                        else ("analytical" if pre_label in {"analytical"} else "stop")
-                    ),
-                    "classification_source": "safety_default",
-                    "llm_error": str(exc),
-                },
-            })
+        },
+    })
 
 
 def _attach_fn_compat(func):
@@ -798,46 +578,73 @@ def route_intent_classification(
 ) -> dict[str, Any]:
     """
     Decision-based routing after intent classification.
+
+    Phase 4 / CRIT-06: ambiguous results no longer fall through as
+    ``invalid_input``; they are routed to a dedicated ``ambiguous`` next-step
+    so the orchestrator can surface a clarification prompt.
     """
+    classification_label = str(classification_result.get("classification", "")).strip().lower()
+    classification_type = str(classification_result.get("classification_type", "")).strip().upper()
+
+    if classification_label == "ambiguous" or classification_type == "AMBIGUOUS":
+        reason = (
+            classification_result.get("classification_reason")
+            or "The question is data-related but too vague to classify."
+        )
+        return {
+            "status": "ambiguous",
+            "next_step": "clarify",
+            "message": (
+                "We could not determine whether this is an analytical or predictive question. "
+                f"{reason}"
+            ),
+            "reason": "ambiguous_intent",
+            "classification": classification_result,
+        }
+
     if not stage_allows_progress(
         classification_result.get("status"),
         degraded=bool(classification_result.get("degraded")),
     ):
-        return {
-            "status": "failed",
-            "message": "Intent classification failed.",
-            "reason": "intent_classification_failed",
-            "details": classification_result,
-        }
-
-    classification_label = str(classification_result.get("classification", "")).strip().lower()
-    if classification_label in {
-        "invalid_input",
-        "numeric_only_input",
-        "noise_input",
-        "empty_input",
-        "transcription_failure",
-        "no_speech_detected",
-    }:
-        reason = classification_result.get("classification_reason") or classification_label
+        reason = (
+            classification_result.get("classification_reason")
+            or classification_result.get("reasoning")
+            or "classification_failed"
+        )
         return {
             "status": "rejected",
-            "message": f"The request is invalid for analysis: {reason}.",
-            "reason": classification_label,
+            "next_step": "stop",
+            "message": f"Classification did not produce a safe analytical or predictive decision: {reason}.",
+            "reason": "classification_failed",
             "classification": classification_result,
         }
 
-    if classification_label == "conversational" or not bool(classification_result.get("is_analytical", False)):
+    if classification_type == "INVALID" or classification_label == "invalid_input":
+        reason = classification_result.get("classification_reason") or "invalid_input"
         return {
             "status": "rejected",
-            "message": "The question is not analytical and cannot be processed.",
+            "next_step": "stop",
+            "message": f"The request is invalid for analysis: {reason}.",
+            "reason": "invalid_input",
+            "classification": classification_result,
+        }
+
+    if classification_type == "NON_DATA" or classification_label == "conversational":
+        return {
+            "status": "rejected",
+            "next_step": "stop",
+            "message": "The question is not data-related and cannot be processed.",
             "reason": "non_analytical",
             "classification": classification_result,
         }
 
     normalized_question_type = str(classification_result.get("question_type", "")).strip().lower()
     requires_forecast = bool(classification_result.get("requires_forecast", False))
-    predictive_state = classification_label in _PREDICTIVE_LABELS or normalized_question_type in _PREDICTIVE_LABELS
+    predictive_state = (
+        classification_label in _PREDICTIVE_LABELS
+        or normalized_question_type in _PREDICTIVE_LABELS
+        or is_predictive(cleaned_text)
+    )
     if predictive_state:
         requires_forecast = True
         classification_result["requires_forecast"] = True

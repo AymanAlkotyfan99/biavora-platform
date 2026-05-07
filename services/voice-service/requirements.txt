@@ -18,9 +18,23 @@ requests==2.31.0
 
 # ClickHouse HTTP Client (for query execution)
 clickhouse-connect
+sqlglot>=25.17.0
 
 # Python dotenv for environment variables
 python-dotenv==1.0.0
+
+# Pydantic v2: shared contracts (bi_platform_shared.contracts)
+pydantic>=2.5,<3.0
+
+# Celery + Redis (CRIT-02 async pipeline)
+celery[redis]==5.3.6
+redis==5.0.1
+
+# Audio validation (CRIT-11 hardening)
+# - mutagen: parse audio container metadata (duration) without ffmpeg.
+# - clamd:  ClamAV TCP daemon client (virus scanning before any other check).
+mutagen==1.47.0
+clamd==1.0.2
 
 # Testing
 pytest==7.4.3
@@ -28,4 +42,3 @@ pytest-django==4.7.0
 
 # Development tools
 ipython==8.17.2
-kafka-python==2.0.2

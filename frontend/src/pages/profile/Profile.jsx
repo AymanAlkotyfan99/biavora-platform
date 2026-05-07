@@ -13,7 +13,7 @@ import {
   Shield,
   User,
 } from 'lucide-react'
-import toast from 'react-hot-toast'
+import { toast } from 'react-toastify'
 
 import { userAPI } from '../../api/endpoints'
 import { useAuthStore } from '../../store/auth'

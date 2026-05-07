@@ -9,12 +9,16 @@ load_dotenv(BASE_DIR.parent.parent / '.env')
 load_dotenv(BASE_DIR.parent.parent / '.env.microservices')
 
 SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'notification-service-secret-key')
-DEBUG = os.getenv('DEBUG', 'True') == 'True'
-_allowed_hosts = [host.strip() for host in os.getenv('ALLOWED_HOSTS', '*').split(',') if host.strip()]
+
+# Phase 11 / CRIT-15: production-safe DEBUG and ALLOWED_HOSTS defaults.
+DEBUG = str(os.getenv('DEBUG', 'False')).strip().lower() in {"1", "true", "yes", "on"}
+
+_raw_allowed_hosts = os.getenv('ALLOWED_HOSTS', '').strip()
+_allowed_hosts = [host.strip() for host in _raw_allowed_hosts.split(',') if host.strip()] if _raw_allowed_hosts else []
 if not _allowed_hosts:
-    _allowed_hosts = ['*']
+    _allowed_hosts = ['localhost', '127.0.0.1'] if DEBUG else []
 # Internal service-to-service requests use the Docker hostname "notification-service".
-if '*' not in _allowed_hosts and 'notification-service' not in _allowed_hosts:
+if 'notification-service' not in _allowed_hosts:
     _allowed_hosts.append('notification-service')
 ALLOWED_HOSTS = _allowed_hosts
 

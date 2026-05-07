@@ -1,3 +1,4 @@
+import hashlib
 import time
 from typing import Any, Optional
 
@@ -21,6 +22,7 @@ class PipelineRequestConfig(Config):
     workspace_id: Optional[str] = None
     report_id: Optional[str] = None
     table_name: Optional[str] = None
+    access_token: Optional[str] = None
 
 
 @asset(
@@ -42,6 +44,7 @@ def pipeline_request_asset(context: AssetExecutionContext, config: PipelineReque
         "workspace_id": str(config.workspace_id or "").strip() or None,
         "report_id": str(config.report_id or "").strip() or None,
         "table_name": str(config.table_name or "").strip() or None,
+        "access_token": str(config.access_token or "").strip() or None,
     }
     context.log.info(
         "Pipeline request received | has_audio=%s has_text=%s user_id_present=%s",
@@ -148,7 +151,10 @@ def transcription_asset(
             },
             output_payload={
                 "status": result.get("status"),
-                "text_preview": str(result.get("text", ""))[:200],
+                "transcript_sha256": hashlib.sha256(
+                    str(result.get("text", "")).encode("utf-8", errors="replace")
+                ).hexdigest(),
+                "transcript_char_len": len(str(result.get("text", ""))),
                 "retry_count": result.get("retry_count", 0),
             },
             success=result.get("status") == "success",

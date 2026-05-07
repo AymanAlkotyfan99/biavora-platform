@@ -13,19 +13,17 @@ import time
 sys.path.insert(0, '/app/detector-service/detector')
 sys.path.insert(0, '/app')
 
-max_retries = 15
-retry_count = 0
+attempt = 1
 
-while retry_count < max_retries:
+while True:
     try:
-        print(f'[DETECTOR] Attempting to start listener (attempt {retry_count+1}/{max_retries})')
+        print(f'[DETECTOR] Starting listener (attempt {attempt})')
         from core.kafka_listener import start_listener
         start_listener()
-        break
+        print('[DETECTOR] Listener stopped unexpectedly. Restarting in 10 seconds...')
     except Exception as e:
         print(f'[DETECTOR ERROR] Kafka not ready: {e}')
-        retry_count += 1
-        time.sleep(10)
+    attempt += 1
+    time.sleep(10)
 
-print('[DETECTOR] Listener stopped')
 "

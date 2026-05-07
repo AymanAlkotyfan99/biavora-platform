@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { toast } from 'react-hot-toast'
+import { toast } from 'react-toastify'
 import { BarChart3, CreditCard, Layers3, LogOut, Plus, Users, Building2 } from 'lucide-react'
 
 import { adminAPI } from '../../api/endpoints'

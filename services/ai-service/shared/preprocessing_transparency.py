@@ -27,7 +27,12 @@ def _default_preprocessing_low(text: str) -> dict[str, Any]:
     return {
         "original_text": normalized_text,
         "cleaned_text": normalized_text,
-        "changes": [],
+        "spelling_corrected_text": normalized_text,
+        "spelling_changes": [],
+        "has_spelling_correction": False,
+        "removed_filler_words": [],
+        "changes": {"spelling_corrections": [], "removed_filler_words": []},
+        "correction_source": "",
     }
 
 
@@ -273,7 +278,43 @@ def build_preprocessing_metadata(
     low_payload = {
         "original_text": source_text,
         "cleaned_text": cleaned_text,
-        "changes": detected_changes or _build_low_changes(source_text, cleaned_text),
+        "spelling_corrected_text": str(preprocess_low_result.get("spelling_corrected_text") or source_text)
+        if isinstance(preprocess_low_result, dict)
+        else source_text,
+        "spelling_changes": (
+            [
+                {
+                    "original": str(change.get("original", "")).strip(),
+                    "corrected": str(change.get("corrected", "")).strip(),
+                }
+                for change in preprocess_low_result.get("spelling_changes", [])
+                if isinstance(change, dict)
+            ]
+            if isinstance(preprocess_low_result, dict)
+            else []
+        ),
+        "has_spelling_correction": bool(preprocess_low_result.get("has_spelling_correction"))
+        if isinstance(preprocess_low_result, dict)
+        else False,
+        "removed_filler_words": (
+            [str(item) for item in preprocess_low_result.get("removed_filler_words", []) if str(item).strip()]
+            if isinstance(preprocess_low_result, dict)
+            else []
+        ),
+        "changes": (
+            preprocess_low_result.get("changes", {})
+            if isinstance(preprocess_low_result, dict) and isinstance(preprocess_low_result.get("changes"), dict)
+            else {
+                "spelling_corrections": [],
+                "removed_filler_words": (
+                    [change.get("before", "") for change in detected_changes if change.get("type") == "removed_filler_words"]
+                ),
+            }
+        ),
+        "correction_source": str(preprocess_low_result.get("correction_source", ""))
+        if isinstance(preprocess_low_result, dict)
+        else "",
+        "detected_changes": detected_changes or _build_low_changes(source_text, cleaned_text),
     }
 
     if not run_high:

@@ -73,11 +73,21 @@ class WorkspaceMemberSerializer(serializers.Serializer):
 
 class WorkspaceSerializer(serializers.ModelSerializer):
     """Serializer for workspace basic information."""
-    
+
+    owner_id = serializers.IntegerField(read_only=True)
+
     class Meta:
         model = Workspace
-        fields = ['id', 'name', 'description', 'company_number', 'company_address', 'created_at']
-        read_only_fields = ['id', 'created_at']
+        fields = [
+            "id",
+            "name",
+            "description",
+            "company_number",
+            "company_address",
+            "created_at",
+            "owner_id",
+        ]
+        read_only_fields = ["id", "created_at", "owner_id"]
 
 
 class InvitationSerializer(serializers.Serializer):

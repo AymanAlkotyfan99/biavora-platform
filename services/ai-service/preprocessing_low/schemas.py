@@ -11,7 +11,14 @@ PreprocessActionType = Literal["retry", "stop"]
 
 class PreprocessResult(TypedDict):
     status: Literal["success", "failed", "degraded"]
+    original_text: str
     cleaned_text: str
+    spelling_corrected_text: str
+    spelling_changes: list[dict[str, str]]
+    has_spelling_correction: bool
+    removed_filler_words: list[str]
+    changes: dict[str, object]
+    correction_source: str
     error_type: str
     action_taken: PreprocessActionType
     degraded: bool
@@ -38,6 +45,12 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _default_preprocess_ollama_timeout() -> float:
+    from shared.ollama_env import global_ollama_read_timeout_seconds
+
+    return global_ollama_read_timeout_seconds()
+
+
 @dataclass(frozen=True)
 class TextPreprocessConfig:
     ollama_url: str
@@ -47,10 +60,12 @@ class TextPreprocessConfig:
 
     @classmethod
     def from_env(cls) -> "TextPreprocessConfig":
+        ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434").strip()
+        default_ollama_url = f"{ollama_host.rstrip('/')}/api/generate"
         return cls(
-            ollama_url=os.getenv("TEXT_PREPROCESS_OLLAMA_URL", "http://localhost:11434/api/generate"),
+            ollama_url=os.getenv("TEXT_PREPROCESS_OLLAMA_URL", default_ollama_url),
             ollama_model=os.getenv("TEXT_PREPROCESS_MODEL", "gemma3:1b"),
-            request_timeout_seconds=_env_float("TEXT_PREPROCESS_TIMEOUT_SECONDS", 20.0),
+            request_timeout_seconds=_env_float("TEXT_PREPROCESS_TIMEOUT_SECONDS", _default_preprocess_ollama_timeout()),
             max_retries=1,
         )
 
@@ -58,7 +73,14 @@ class TextPreprocessConfig:
 def build_preprocess_success_result(cleaned_text: str) -> PreprocessResult:
     return {
         "status": "success",
+        "original_text": "",
         "cleaned_text": cleaned_text,
+        "spelling_corrected_text": "",
+        "spelling_changes": [],
+        "has_spelling_correction": False,
+        "removed_filler_words": [],
+        "changes": {"spelling_corrections": [], "removed_filler_words": []},
+        "correction_source": "",
         "error_type": "none",
         "action_taken": "stop",
         "degraded": False,
@@ -82,7 +104,14 @@ def build_preprocess_failed_result(
 ) -> PreprocessResult:
     return {
         "status": "failed",
+        "original_text": "",
         "cleaned_text": "",
+        "spelling_corrected_text": "",
+        "spelling_changes": [],
+        "has_spelling_correction": False,
+        "removed_filler_words": [],
+        "changes": {"spelling_corrections": [], "removed_filler_words": []},
+        "correction_source": "",
         "error_type": error_type,
         "action_taken": action_taken,
         "degraded": False,

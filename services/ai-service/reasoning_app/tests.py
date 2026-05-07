@@ -136,6 +136,18 @@ class ReasoningRulesTests(unittest.TestCase):
         self.assertEqual(result["classification"], "analytical")
         self.assertTrue(result["is_analytical"])
 
+    def test_cumulative_total_sales_with_underscore_is_analytical(self):
+        question = "Show cumulative total_sales over time"
+        result = run_intent_classification(
+            cleaned_text=question,
+            raw_text=question,
+            source="text",
+            transcription_status="success",
+        )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["classification"], "analytical")
+        self.assertTrue(result["is_analytical"])
+
     @patch("preprocessing_low.preprocess_task._call_ollama_preprocessor", side_effect=RuntimeError("ollama down"))
     def test_low_preprocess_uses_rule_based_fallback_when_llm_fails(self, _mock_llm):
         result = run_preprocess_text("show total population by region")

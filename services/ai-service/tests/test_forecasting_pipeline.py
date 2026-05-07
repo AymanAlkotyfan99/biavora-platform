@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from datetime import date, timedelta
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath("services/ai-service"))
@@ -200,6 +201,35 @@ class ForecastingPipelineTests(unittest.TestCase):
         with self.assertRaises(Exception):
             build_sql_from_intent(query="Forecast total sales", intent=intent, schema=schema)
 
+    @patch("intent_extraction.routing.validate_sql")
+    def test_predictive_sql_builder_auto_selects_best_table_when_not_provided(self, _mock_validate_sql):
+        schema = {
+            "events": [
+                {"name": "id", "type": "UInt64"},
+                {"name": "created_at", "type": "DateTime"},
+            ],
+            "orders_fact": [
+                {"name": "ds", "type": "Date"},
+                {"name": "orders_count", "type": "Float64"},
+            ],
+        }
+        intent = {
+            "intent_type": "predictive",
+            "table": "",
+            "metric": "orders_count",
+            "time_column": "ds",
+            "granularity": "day",
+            "forecast_horizon": 7,
+            "requires_forecast": True,
+            "question_type": "predictive",
+        }
+        normalized, _sql = build_sql_from_intent(
+            query="Predict number of orders for next week",
+            intent=intent,
+            schema=schema,
+        )
+        self.assertEqual(normalized["table"], "orders_fact")
+
     @patch("forecasting.dagster_handler.build_forecast_dataset")
     def test_forecasting_handler_marks_forecast_error_as_degraded(self, mock_build_forecast_dataset):
         from forecasting.pipeline import ForecastingError
@@ -214,6 +244,75 @@ class ForecastingPipelineTests(unittest.TestCase):
         self.assertEqual(result.get("status"), "degraded")
         self.assertTrue(result.get("degraded"))
         self.assertEqual(result.get("degradation_reason"), "timesfm_unavailable")
+
+    @patch.dict(os.environ, {"TIMESFM_MIN_POINTS": "5"}, clear=False)
+    @patch("forecasting.pipeline.forecast")
+    def test_predict_next_7_days_returns_90_actual_plus_7_forecast_sorted_daily(self, mock_forecast):
+        mock_forecast.return_value = {
+            "point_forecast": [2300, 2310, 2320, 2330, 2340, 2350, 2360],
+            "model_status": {"provider": "test", "used_fallback": False},
+            "quantiles": {},
+        }
+        start = date(2023, 1, 1)
+        rows = []
+        for idx in range(90):
+            current = start + timedelta(days=idx)
+            rows.append(
+                {
+                    "ds": f"{current.month}/{current.day}/{current.year}",
+                    "total_sales": 1000 + idx,
+                }
+            )
+
+        result = build_forecast_dataset(
+            columns=["ds", "total_sales"],
+            rows=rows,
+            intent={"time_column": "ds", "metric": "total_sales", "granularity": "day", "forecast_horizon": 7},
+        )
+        output_rows = result["rows"]
+        actual_rows = [row for row in output_rows if row.get("series_type") == "actual"]
+        forecast_rows = [row for row in output_rows if row.get("series_type") == "forecast"]
+
+        self.assertEqual(len(actual_rows), 90)
+        self.assertEqual(len(forecast_rows), 7)
+        self.assertEqual(actual_rows[0]["ds"], "2023-01-01")
+        self.assertEqual(actual_rows[-1]["ds"], "2023-03-31")
+        self.assertEqual([row["ds"] for row in forecast_rows], [
+            "2023-04-01",
+            "2023-04-02",
+            "2023-04-03",
+            "2023-04-04",
+            "2023-04-05",
+            "2023-04-06",
+            "2023-04-07",
+        ])
+
+        sorted_ds = [row["ds"] for row in output_rows]
+        self.assertEqual(sorted_ds, sorted(sorted_ds))
+        self.assertEqual(result["meta"]["granularity"], "day")
+        self.assertEqual(result["meta"]["forecast_start_date"], "2023-04-01")
+
+    @patch.dict(os.environ, {"TIMESFM_MIN_POINTS": "5"}, clear=False)
+    @patch("forecasting.pipeline.forecast")
+    def test_forecasting_handler_visualization_payload_line_and_daily(self, mock_forecast):
+        mock_forecast.return_value = {
+            "point_forecast": [11, 12, 13, 14, 15, 16, 17],
+            "model_status": {"provider": "test", "used_fallback": False},
+            "quantiles": {},
+        }
+        rows = [
+            {"ds": f"1/{day}/2023", "value": float(day)}
+            for day in range(1, 91)
+        ]
+        result = run_forecasting_handler(
+            {
+                "historical_data": {"columns": ["ds", "value"], "rows": rows},
+                "intent": {"intent_type": "predictive", "time_column": "ds", "metric": "value", "granularity": "day", "forecast_horizon": 7},
+            }
+        )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["visualization_payload"]["chart_type"], "line")
+        self.assertEqual(result["forecast_meta"].get("granularity"), "day")
 
 
 if __name__ == "__main__":

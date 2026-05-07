@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from 'react'
 import { motion } from 'framer-motion'
-import { toast } from 'react-hot-toast'
+import { toast } from 'react-toastify'
 import { useSearchParams } from 'react-router-dom'
 import { 
   Code, 

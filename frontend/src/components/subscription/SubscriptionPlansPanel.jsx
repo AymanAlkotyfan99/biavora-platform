@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Check, CreditCard, Landmark, Sparkles, ShieldCheck, Zap } from 'lucide-react'
-import { toast } from 'react-hot-toast'
+import { toast } from 'react-toastify'
 
 import Card from '../Card'
 import Button from '../Button'

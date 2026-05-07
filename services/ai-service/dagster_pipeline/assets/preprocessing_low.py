@@ -21,54 +21,22 @@ def preprocessing_low_asset(
 ) -> dict[str, Any]:
     stage_started_at = utc_now_iso()
     stage_started_perf = time.perf_counter()
+    transcription_text = str(transcription_asset.get("text", "")).strip()
     if not stage_allows_progress(transcription_asset.get("status"), degraded=bool(transcription_asset.get("degraded"))):
         context.log.warning(
-            "Skipping low preprocessing because transcription failed | error_type=%s",
+            "Low preprocessing received degraded transcription | status=%s error_type=%s",
+            transcription_asset.get("status"),
             transcription_asset.get("error_type"),
         )
-        attempts = [
-            make_attempt(
-                attempt_number=1,
-                input_payload={"transcription_status": transcription_asset.get("status")},
-                output_payload={},
-                success=False,
-                retry_triggered=False,
-                model_or_method_used="upstream_guard",
-                duration_ms=0,
-                validation_result={"is_valid": False},
-                error_type="upstream_transcription_failed",
-                error_message="Low preprocessing skipped because transcription failed.",
-            )
-        ]
-        return {
-            "status": "skipped",
-            "cleaned_text": "",
-            "error_type": "upstream_transcription_failed",
-            "action_taken": "stop",
-            "detected_changes": [],
-            "attempts": attempts,
-            "attempts_count": len(attempts),
-            "started_at": stage_started_at,
-            "finished_at": utc_now_iso(),
-            "duration_ms": int((time.perf_counter() - stage_started_perf) * 1000),
-            "warnings": [],
-            "errors": [
-                {
-                    "type": "upstream_transcription_failed",
-                    "message": "Low preprocessing skipped because transcription failed.",
-                }
-            ],
-            "debug_metadata": {
-                "dataset_context": {
-                    "workspace_id": pipeline_request_asset.get("workspace_id"),
-                    "dataset_id": pipeline_request_asset.get("dataset_id") or pipeline_request_asset.get("source_id"),
-                    "manager_id": pipeline_request_asset.get("manager_id") or pipeline_request_asset.get("user_id"),
-                    "table_name": pipeline_request_asset.get("table_name"),
-                }
-            },
-        }
+        fallback_text = str(
+            pipeline_request_asset.get("text")
+            or pipeline_request_asset.get("query")
+            or pipeline_request_asset.get("question")
+            or ""
+        ).strip()
+        transcription_text = fallback_text or transcription_text
 
-    result = run_preprocess_text(text=str(transcription_asset.get("text", "")))
+    result = run_preprocess_text(text=transcription_text)
     if "started_at" not in result:
         result["started_at"] = stage_started_at
     if "finished_at" not in result:
@@ -76,7 +44,7 @@ def preprocessing_low_asset(
     if "duration_ms" not in result or not result.get("duration_ms"):
         result["duration_ms"] = int((time.perf_counter() - stage_started_perf) * 1000)
     result.setdefault("debug_metadata", {})
-    result["debug_metadata"]["input_chars"] = len(str(transcription_asset.get("text", "")))
+    result["debug_metadata"]["input_chars"] = len(transcription_text)
     result["debug_metadata"]["dataset_context"] = {
         "workspace_id": pipeline_request_asset.get("workspace_id"),
         "dataset_id": pipeline_request_asset.get("dataset_id") or pipeline_request_asset.get("source_id"),

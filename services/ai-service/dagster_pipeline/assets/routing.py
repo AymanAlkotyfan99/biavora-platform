@@ -24,42 +24,42 @@ def routing_asset(
     stage_started_at = utc_now_iso()
     stage_started_perf = time.perf_counter()
     if not stage_allows_progress(intent_extraction_asset.get("status"), degraded=bool(intent_extraction_asset.get("degraded"))):
-        context.log.warning(
-            "Skipping routing because intent extraction was not successful | status=%s",
-            intent_extraction_asset.get("status"),
-        )
+        message = str(intent_extraction_asset.get("message") or "Routing skipped because intent extraction did not allow progress.")
+        context.log.warning("Routing stopped by upstream gate | intent_status=%s message=%s", intent_extraction_asset.get("status"), message)
         attempts = [
             make_attempt(
                 attempt_number=1,
-                input_payload={"intent_extraction_status": intent_extraction_asset.get("status")},
+                input_payload={"intent_status": intent_extraction_asset.get("status")},
                 output_payload={},
                 success=False,
                 retry_triggered=False,
-                model_or_method_used="upstream_guard",
+                model_or_method_used="upstream_stage_guard",
                 duration_ms=0,
                 validation_result={"is_valid": False},
-                error_type="upstream_intent_extraction_failed",
-                error_message="Routing skipped because intent extraction was not successful.",
+                error_type="upstream_rejected",
+                error_message=message,
             )
         ]
         return {
             "status": "skipped",
-            "next_step": "metabase",
-            "error_type": "upstream_intent_extraction_failed",
+            "next_step": "stop",
+            "error_type": "upstream_rejected",
             "action_taken": "stop",
+            "message": message,
             "attempts": attempts,
             "attempts_count": len(attempts),
             "started_at": stage_started_at,
             "finished_at": utc_now_iso(),
             "duration_ms": int((time.perf_counter() - stage_started_perf) * 1000),
             "warnings": [],
-            "errors": [
-                {
-                    "type": "upstream_intent_extraction_failed",
-                    "message": "Routing skipped because intent extraction was not successful.",
-                }
-            ],
-            "debug_metadata": {},
+            "errors": [{"type": "upstream_rejected", "message": message}],
+            "debug_metadata": {
+                "upstream_status": intent_extraction_asset.get("status"),
+                "upstream_stage": "intent_extraction",
+            },
+            "upstream_status": intent_extraction_asset.get("status"),
+            "upstream_stage": "intent_extraction",
+            "classification": intent_extraction_asset,
         }
 
     next_step = str(intent_extraction_asset.get("next_step", "metabase")).strip().lower()

@@ -9,6 +9,8 @@ import requests
 import logging
 import json
 
+from bi_platform_shared.http import HttpClientError, get_default_client
+
 from .models import Database
 from .serializers import (
     DatabaseSerializer,
@@ -34,9 +36,13 @@ class DatabaseHealthCheckView(APIView):
         # Check ETL service
         etl_status = 'unknown'
         try:
-            etl_response = requests.get(f'{etl_url}/api/upload/', timeout=2)
+            etl_response = get_default_client().get(
+                f'{etl_url}/api/upload/',
+                timeout=(1.0, 2.0),
+                attach_internal_api_key=False,
+            )
             etl_status = 'reachable'
-        except requests.exceptions.RequestException:
+        except (HttpClientError, requests.exceptions.RequestException):
             etl_status = 'unreachable'
         
         return Response({
@@ -109,11 +115,12 @@ class DatabaseUploadView(APIView):
             
             logger.info(f"Forwarding to ETL: {etl_upload_endpoint}")
             
-            # Make request with timeout
-            etl_response = requests.post(
+            # Phase 13 / GAP-05: forward upload via shared HTTP client (retries, breaker, trace context).
+            etl_response = get_default_client().post(
                 etl_upload_endpoint,
                 files=files,
-                timeout=30
+                timeout=(5.0, 30.0),
+                attach_internal_api_key=False,
             )
             
             logger.info(f"ETL Response: Status={etl_response.status_code}, Content-Type={etl_response.headers.get('Content-Type')}")

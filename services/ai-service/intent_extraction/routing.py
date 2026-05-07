@@ -1,19 +1,73 @@
 from __future__ import annotations
 
-import importlib
 import re
-from functools import lru_cache
-from typing import Any, Callable
+from typing import Any
 
 from intent_extraction.error_handler import (
     IntentExtractionSchemaMismatchError,
-    IntentExtractionSystemError,
 )
-from intent_extraction.schemas import IntentExtractionConfig, NextStepType, StructuredIntent
+from intent_extraction.schemas import IntentExtractionConfig, StructuredIntent
 from shared.pipeline_guards import is_technical_column_name
 from shared.query_planner import normalize_analytical_intent
-from shared.sql_compiler import compile_sql
-from shared.sql_validator import validate_sql
+from shared.semantic_contract_validator import validate_semantic_contract
+from shared.sql_compiler import (
+    DEFAULT_CH_SETTINGS,
+    _format_ch_settings,
+    _resolve_workspace_db,
+    compile_sql,
+)
+from shared.sql_review import validate_sql  # SQL safety is now centralised in sql_review (CRIT-04).
+
+
+def _coerce_metrics_to_objects_for_sql_compiler(intent: dict[str, Any]) -> None:
+    """``compile_sql`` requires ``metrics`` as list[dict]; validation may leave string columns."""
+
+    metrics = intent.get("metrics")
+    if not isinstance(metrics, list) or not metrics:
+        return
+    if all(isinstance(m, dict) for m in metrics):
+        return
+    specs = intent.get("metric_specs") if isinstance(intent.get("metric_specs"), list) else []
+    if specs and all(isinstance(s, dict) for s in specs):
+        intent["metrics"] = [dict(s) for s in specs]
+        return
+    rebuilt: list[dict[str, Any]] = []
+    for m in metrics:
+        if isinstance(m, dict):
+            rebuilt.append(dict(m))
+        elif isinstance(m, str) and m.strip() and m != "*":
+            col = m.strip()
+            rebuilt.append({"column": col, "aggregation": "SUM", "alias": col})
+    if rebuilt:
+        intent["metrics"] = rebuilt
+
+
+def _qualify_with_workspace_db(
+    table_name: str,
+    *,
+    workspace_clickhouse_db: str | None,
+) -> str:
+    """Phase 6 / CRIT-05: qualify a bare table name with the workspace DB.
+
+    The compiler does this for analytical SQL; this helper reuses the same
+    resolution rules for the hand-written predictive SQL emitted in
+    ``_build_historical_forecast_sql``.
+    """
+
+    cleaned = str(table_name or "").strip()
+    if not cleaned:
+        return cleaned
+    if "." in cleaned:
+        return cleaned
+    workspace_db = _resolve_workspace_db(
+        intent={},
+        workspace_clickhouse_db=workspace_clickhouse_db,
+    )
+    return f"{workspace_db}.{cleaned}"
+
+
+def _compile_ch_settings_comment() -> str:
+    return _format_ch_settings(DEFAULT_CH_SETTINGS) or ""
 
 _GRANULARITY_TO_CLICKHOUSE_EXPR = {
     "hour": "toStartOfHour({column})",
@@ -54,9 +108,24 @@ def _build_predictive_time_expr(
     template = _GRANULARITY_TO_CLICKHOUSE_EXPR.get(granularity, "toDate({column})")
     if granularity == "day" and ("date" in column_type and "datetime" not in column_type and "timestamp" not in column_type):
         return column_name
-    base_column = f"toDate({column_name})" if _is_string_like_type(column_type) else column_name
+    if _is_string_like_type(column_type):
+        parsed_expr = _string_time_parse_expr(column_name)
+        if granularity == "day":
+            return f"toDate({parsed_expr})"
+        base_column = parsed_expr
+    else:
+        base_column = column_name
     expr = template.format(column=base_column)
     return _normalize_clickhouse_date_casts(expr)
+
+
+def _string_time_parse_expr(column_name: str) -> str:
+    return (
+        f"coalesce("
+        f"parseDateTimeBestEffortUSOrNull({column_name}), "
+        f"parseDateTimeBestEffortOrNull({column_name})"
+        f")"
+    )
 
 
 def _build_query_builder_payload(intent: StructuredIntent) -> dict[str, Any]:
@@ -90,6 +159,25 @@ def _build_query_builder_payload(intent: StructuredIntent) -> dict[str, Any]:
         target_column = str(intent.get("target_column", "*") or "*").strip() or "*"
         metrics_payload = [target_column]
 
+    chart_payload = intent.get("chart") if isinstance(intent.get("chart"), dict) else {}
+    selected_chart_type = (
+        str(intent.get("selected_chart_type", "")).strip().lower()
+        or str(intent.get("chart_type", "")).strip().lower()
+        or str(chart_payload.get("type", "")).strip().lower()
+    )
+    metric_type = (
+        str(intent.get("metric_type", "")).strip().lower()
+        or str(chart_payload.get("metric_type", "")).strip().lower()
+    )
+    if metric_type == "percentage" and not selected_chart_type:
+        selected_chart_type = "pie"
+    normalized_chart_payload = {
+        **chart_payload,
+        "type": selected_chart_type or chart_payload.get("type"),
+        "metric_type": metric_type or chart_payload.get("metric_type"),
+        "group_by": chart_payload.get("group_by"),
+    }
+
     return {
         "table": intent["table"],
         "intent": str(intent.get("intent", "analytical") or "analytical"),
@@ -102,6 +190,10 @@ def _build_query_builder_payload(intent: StructuredIntent) -> dict[str, Any]:
         "limit": limit,
         "ranking": intent.get("ranking", {}),
         "ambiguities": intent.get("ambiguities", []),
+        "chart": normalized_chart_payload,
+        "metric_type": metric_type,
+        "selected_chart_type": selected_chart_type,
+        "chart_type": selected_chart_type,
     }
 
 
@@ -122,11 +214,51 @@ def build_sql_from_intent(
     query: str,
     intent: StructuredIntent,
     schema: dict[str, list[dict[str, Any]]],
+    workspace_clickhouse_db: str | None = None,
+    preprocess_hints: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str]:
-    if str(intent.get("intent_type", "")).strip().lower() == "predictive":
-        return _build_historical_forecast_sql(intent=intent, schema=schema)
+    predictive_requested = bool(
+        str(intent.get("intent_type", "")).strip().lower() == "predictive"
+        or intent.get("requires_forecast")
+        or str(intent.get("question_type", "")).strip().lower() in {"predictive", "forecast", "forecasting"}
+    )
+    if predictive_requested:
+        intent["intent_type"] = "predictive"
+        intent["requires_forecast"] = True
+        return _build_historical_forecast_sql(
+            intent=intent,
+            schema=schema,
+            workspace_clickhouse_db=workspace_clickhouse_db,
+        )
 
     query_builder_payload = _build_query_builder_payload(intent)
+    preprocessing_hints = {
+        "selected_table": str(intent.get("table", "")).strip(),
+        "selected_columns": sorted(
+            {
+                str(metric.get("column", "")).strip()
+                for metric in (intent.get("metric_specs", []) if isinstance(intent.get("metric_specs"), list) else [])
+                if isinstance(metric, dict) and str(metric.get("column", "")).strip()
+            }
+            | {
+                str(metric).strip()
+                for metric in (intent.get("metrics", []) if isinstance(intent.get("metrics"), list) else [])
+                if isinstance(metric, str) and str(metric).strip()
+            }
+            | {
+                str(dimension).strip()
+                for dimension in (intent.get("dimensions", []) if isinstance(intent.get("dimensions"), list) else [])
+                if str(dimension).strip()
+            }
+            | (
+                {str(intent.get("time_column")).strip()}
+                if str(intent.get("time_column", "")).strip()
+                else set()
+            )
+        ),
+    }
+    if isinstance(preprocess_hints, dict):
+        preprocessing_hints = {**preprocessing_hints, **preprocess_hints}
 
     try:
         normalized_intent = normalize_analytical_intent(
@@ -134,8 +266,68 @@ def build_sql_from_intent(
             raw_intent=query_builder_payload,
             schema=schema,
         )
-        sql_query = compile_sql(normalized_intent, schema=schema)
+        normalized_intent = validate_semantic_contract(
+            question=query,
+            intent=normalized_intent,
+            schema=schema,
+            preprocess_hints=preprocessing_hints,
+        )
+        if normalized_intent.get("time_grouping_detected") and normalized_intent.get("intent") == "time_series":
+            time_alias = str(normalized_intent.get("time_dimension_alias") or "date").strip() or "date"
+            normalized_intent["order_by"] = [{"column": time_alias, "direction": "ASC"}]
+            ranking = normalized_intent.get("ranking") if isinstance(normalized_intent.get("ranking"), dict) else {}
+            normalized_intent["ranking"] = {**ranking, "direction": None, "requested": False, "source": "time_series_order"}
+        if isinstance(normalized_intent, dict):
+            # Prefer semantic-contract / planner output over stale upstream intent so
+            # time-series and multi-metric chart choices are not overwritten here.
+            selected_chart_type = (
+                str(normalized_intent.get("selected_chart_type", "")).strip().lower()
+                or str(normalized_intent.get("chart_type", "")).strip().lower()
+                or str((normalized_intent.get("chart") or {}).get("type") if isinstance(normalized_intent.get("chart"), dict) else "").strip().lower()
+                or str(intent.get("selected_chart_type", "")).strip().lower()
+                or str(intent.get("chart_type", "")).strip().lower()
+                or str((intent.get("chart") or {}).get("type") if isinstance(intent.get("chart"), dict) else "").strip().lower()
+            )
+            metric_type = (
+                str(normalized_intent.get("metric_type", "")).strip().lower()
+                or str((normalized_intent.get("chart") or {}).get("metric_type") if isinstance(normalized_intent.get("chart"), dict) else "").strip().lower()
+                or str(intent.get("metric_type", "")).strip().lower()
+                or str((intent.get("chart") or {}).get("metric_type") if isinstance(intent.get("chart"), dict) else "").strip().lower()
+            )
+            if metric_type == "percentage" and not selected_chart_type:
+                selected_chart_type = "pie"
+            upstream_chart = normalized_intent.get("chart", {}) if isinstance(normalized_intent.get("chart"), dict) else {}
+            legacy_chart = intent.get("chart", {}) if isinstance(intent.get("chart"), dict) else {}
+            normalized_intent["chart"] = {
+                **legacy_chart,
+                **upstream_chart,
+                "type": selected_chart_type or upstream_chart.get("type") or legacy_chart.get("type"),
+                "metric_type": metric_type or upstream_chart.get("metric_type") or legacy_chart.get("metric_type"),
+                "group_by": upstream_chart.get("group_by") or legacy_chart.get("group_by"),
+            }
+            normalized_intent["metric_type"] = metric_type
+            normalized_intent["selected_chart_type"] = selected_chart_type
+            normalized_intent["chart_type"] = selected_chart_type
+        # Phase 6 / CRIT-05: propagate the per-tenant ClickHouse database so
+        # the compiler emits ``<workspace_db>.<table>`` instead of the legacy
+        # ``etl.<table>`` default.
+        _coerce_metrics_to_objects_for_sql_compiler(normalized_intent)
+        sql_query = compile_sql(
+            normalized_intent,
+            schema=schema,
+            workspace_clickhouse_db=workspace_clickhouse_db,
+        )
         validate_sql(sql_query)
+        normalized_intent = validate_semantic_contract(
+            question=query,
+            intent=normalized_intent,
+            schema=schema,
+            sql=sql_query,
+            chart_type=str(normalized_intent.get("selected_chart_type", "")),
+            preprocess_hints=preprocessing_hints,
+        )
+        if normalized_intent.get("semantic_contract_errors"):
+            raise ValueError("; ".join(normalized_intent["semantic_contract_errors"]))
     except ValueError as exc:
         if _is_schema_mismatch_message(str(exc)):
             raise IntentExtractionSchemaMismatchError(str(exc)) from exc
@@ -160,6 +352,42 @@ def _resolve_schema_table(schema: dict[str, list[dict[str, Any]]], requested_tab
     if not schema:
         raise IntentExtractionSchemaMismatchError("Schema is empty.")
     return sorted(schema.keys())[0]
+
+
+def _resolve_schema_table_for_predictive(
+    *,
+    schema: dict[str, list[dict[str, Any]]],
+    requested_table: str,
+    requested_metric: str,
+    requested_time_column: str,
+) -> str:
+    resolved = _resolve_schema_table(schema, requested_table)
+    if requested_table and resolved:
+        return resolved
+    metric_hint = str(requested_metric or "").strip().lower()
+    time_hint = str(requested_time_column or "").strip().lower()
+    if not metric_hint and not time_hint:
+        return resolved
+    scored: list[tuple[int, str]] = []
+    for table_name, cols in schema.items():
+        col_names = [str(c.get("name", "")).strip().lower() for c in (cols or []) if isinstance(c, dict)]
+        score = 0
+        if metric_hint and metric_hint in col_names:
+            score += 3
+        if time_hint and time_hint in col_names:
+            score += 3
+        if not time_hint and any(t in col_names for t in ("ds", "date", "datetime", "timestamp", "time")):
+            score += 2
+        if not metric_hint and any(
+            any(token in name for token in ("sales", "revenue", "amount", "total", "count", "orders", "value"))
+            for name in col_names
+        ):
+            score += 1
+        scored.append((score, table_name))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    if scored and scored[0][0] > 0:
+        return scored[0][1]
+    return resolved
 
 
 def _resolve_schema_column(
@@ -192,8 +420,14 @@ def _build_historical_forecast_sql(
     *,
     intent: StructuredIntent,
     schema: dict[str, list[dict[str, Any]]],
+    workspace_clickhouse_db: str | None = None,
 ) -> tuple[dict[str, Any], str]:
-    resolved_table = _resolve_schema_table(schema, str(intent.get("table", "")).strip())
+    resolved_table = _resolve_schema_table_for_predictive(
+        schema=schema,
+        requested_table=str(intent.get("table", "")).strip(),
+        requested_metric=str(intent.get("metric", "")).strip() or str(intent.get("target_column", "")).strip(),
+        requested_time_column=str(intent.get("time_column", "")).strip(),
+    )
     table_columns = schema.get(resolved_table, [])
     if not table_columns:
         raise IntentExtractionSchemaMismatchError(f"Table '{resolved_table}' not found in schema.")
@@ -239,9 +473,16 @@ def _build_historical_forecast_sql(
         )
     value_expr = f"sum(toFloat64({resolved_metric}))"
 
+    # Phase 6 / CRIT-05: forecast SQL must also be per-tenant qualified.
+    qualified_table = _qualify_with_workspace_db(
+        resolved_table,
+        workspace_clickhouse_db=workspace_clickhouse_db,
+    )
+
     sql_query = (
+        f"{_compile_ch_settings_comment()}\n"
         f"SELECT {time_expr} AS ds, {value_expr} AS value "
-        f"FROM {resolved_table} "
+        f"FROM {qualified_table} "
         f"WHERE {resolved_time_column} IS NOT NULL AND {resolved_metric} IS NOT NULL "
         "GROUP BY ds "
         "ORDER BY ds ASC"
@@ -272,164 +513,43 @@ def _build_historical_forecast_sql(
     return normalized_intent, sql_query
 
 
-@lru_cache(maxsize=16)
-def _load_callable_from_path(path: str) -> Callable[..., Any] | None:
-    if not path:
-        return None
-    if ":" not in path:
-        raise IntentExtractionSystemError(
-            f"Invalid integration path '{path}'. Expected format module.submodule:function_name."
-        )
-
-    module_path, function_name = path.split(":", 1)
-    try:
-        module = importlib.import_module(module_path)
-    except Exception as exc:  # noqa: BLE001
-        raise IntentExtractionSystemError(
-            f"Failed to import integration module '{module_path}': {exc}"
-        ) from exc
-
-    handler = getattr(module, function_name, None)
-    if handler is None or not callable(handler):
-        raise IntentExtractionSystemError(
-            f"Integration handler '{function_name}' not found or not callable in '{module_path}'."
-        )
-    return handler
-
-
-def _call_handler(handler: Callable[..., Any], payload: dict[str, Any]) -> Any:
-    try:
-        return handler(payload)
-    except TypeError:
-        if "sql_query" in payload:
-            return handler(payload["sql_query"])
-        raise
-
-
-def _execute_clickhouse(
-    *,
-    sql_query: str,
-    normalized_intent: dict[str, Any],
-    config: IntentExtractionConfig,
-) -> Any:
-    handler = _load_callable_from_path(config.clickhouse_executor_path)
-    if handler is None:
-        return {
-            "status": "pending_integration",
-            "message": "ClickHouse execution handler is not configured.",
-            "sql_query": sql_query,
-        }
-
-    payload = {
-        "sql_query": sql_query,
-        "intent": normalized_intent,
-    }
-    try:
-        return _call_handler(handler, payload)
-    except Exception as exc:  # noqa: BLE001
-        raise IntentExtractionSystemError(f"ClickHouse execution handler failed: {exc}") from exc
-
-
-def execute_clickhouse_query(
-    *,
-    sql_query: str,
-    normalized_intent: dict[str, Any],
-    config: IntentExtractionConfig,
-) -> Any:
-    """
-    Public wrapper for ClickHouse execution stage.
-    """
-    return _execute_clickhouse(
-        sql_query=sql_query,
-        normalized_intent=normalized_intent,
-        config=config,
-    )
-
-
-def _route_downstream(
-    *,
-    intent: StructuredIntent,
-    sql_query: str,
-    execution_result: Any,
-    config: IntentExtractionConfig,
-) -> tuple[NextStepType, Any]:
-    if intent["intent_type"] == "predictive":
-        next_step: NextStepType = "forecasting"
-        handler_path = config.forecasting_handler_path
-        payload = {
-            "historical_data": execution_result,
-            "sql_query": sql_query,
-            "intent": intent,
-        }
-    else:
-        next_step = "metabase"
-        handler_path = config.metabase_handler_path
-        payload = {
-            "execution_result": execution_result,
-            "sql_query": sql_query,
-            "intent": intent,
-        }
-
-    handler = _load_callable_from_path(handler_path)
-    if handler is None:
-        return next_step, {
-            "status": "pending_integration",
-            "message": f"{next_step} handler is not configured.",
-            "next_step": next_step,
-        }
-
-    try:
-        return next_step, _call_handler(handler, payload)
-    except Exception as exc:  # noqa: BLE001
-        raise IntentExtractionSystemError(f"{next_step} handler failed: {exc}") from exc
-
-
-def execute_downstream_route(
-    *,
-    intent: StructuredIntent,
-    sql_query: str,
-    execution_result: Any,
-    config: IntentExtractionConfig,
-) -> tuple[NextStepType, Any]:
-    """
-    Public wrapper for route-specific downstream execution
-    (analytical -> Metabase, predictive -> forecasting).
-    """
-    return _route_downstream(
-        intent=intent,
-        sql_query=sql_query,
-        execution_result=execution_result,
-        config=config,
-    )
-
-
 def route_intent(
     *,
     query: str,
     intent: StructuredIntent,
     schema: dict[str, list[dict[str, Any]]],
     config: IntentExtractionConfig,
+    workspace_clickhouse_db: str | None = None,
+    preprocess_hints: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Build SQL for a validated intent and wrap it in the routing payload.
+
+    Phase 6 / CRIT-05: ``workspace_clickhouse_db`` is propagated all the way
+    down to ``compile_sql`` / ``_build_historical_forecast_sql`` so the
+    emitted SQL is per-tenant qualified.
+    """
+
+    # Allow the caller to embed the DB on the intent itself; this is the
+    # path taken by the orchestrator after preprocessing-high resolves the
+    # workspace context.
+    if not workspace_clickhouse_db and isinstance(intent, dict):
+        embedded = intent.get("workspace_clickhouse_db")
+        if isinstance(embedded, str) and embedded.strip():
+            workspace_clickhouse_db = embedded.strip()
     normalized_intent, sql_query = build_sql_from_intent(
         query=query,
         intent=intent,
         schema=schema,
+        workspace_clickhouse_db=workspace_clickhouse_db,
+        preprocess_hints=preprocess_hints,
     )
-    execution_result = execute_clickhouse_query(
-        sql_query=sql_query,
-        normalized_intent=normalized_intent,
-        config=config,
-    )
-    next_step, downstream_result = execute_downstream_route(
-        intent=normalized_intent,  # ensure predictive invariants propagate downstream
-        sql_query=sql_query,
-        execution_result=execution_result,
-        config=config,
-    )
+    next_step = "forecasting" if str(normalized_intent.get("intent_type", "")).strip().lower() == "predictive" else "metabase"
     return {
         "sql_query": sql_query,
         "next_step": next_step,
         "normalized_intent": normalized_intent,
-        "execution_result": execution_result,
-        "downstream_result": downstream_result,
+        "execution_result": None,
+        "downstream_result": None,
+        "execution_delegated": "query-service",
+        "downstream_delegated": "voice-service",
     }

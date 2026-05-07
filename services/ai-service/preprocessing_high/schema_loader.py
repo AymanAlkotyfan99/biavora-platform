@@ -1,11 +1,27 @@
+"""Schema loader (Phase 13 / GAP-01).
+
+Phase 13 changes:
+
+* Schema cache is keyed by ``(database, user_id, dataset_scope)`` and
+  carries a TTL (existing) AND a fingerprint (new). The fingerprint is a
+  SHA-256 prefix of ``(table, column, type)`` triples so callers can
+  detect drift even if the TTL has not yet expired.
+* New ``invalidate_schema_cache`` and ``invalidate_all_schema_caches``
+  helpers let downstream services (ETL, schema-refresh endpoint) drop
+  a stale schema explicitly without restarting the service.
+* ``schema_fingerprint`` is exposed publicly so the trace can carry it
+  via ``schema_provenance``.
+"""
+
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Optional
 
 import clickhouse_connect
 
@@ -14,7 +30,11 @@ from preprocessing_high.error_handler import (
     PreprocessHighSchemaLoadError,
 )
 from preprocessing_high.schemas import HighPreprocessConfig, UserSchema
-from shared.dataset_binding import normalize_dataset_context, validate_dataset_context
+from shared.dataset_binding import (
+    has_complete_dataset_context,
+    normalize_dataset_context,
+    validate_dataset_context,
+)
 from shared.pipeline_guards import dataset_scope_guard, is_technical_column_name
 from shared.schema_filtering import filter_business_schema
 from shared.schema_utils import is_date_type, unqualify_table_name
@@ -23,6 +43,56 @@ from shared.schema_utils import is_date_type, unqualify_table_name
 _SAFE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SCHEMA_CACHE: dict[str, tuple[float, "LoadedUserSchema"]] = {}
 _SCHEMA_CACHE_LOCK = threading.Lock()
+
+
+def schema_fingerprint(schema: UserSchema) -> str:
+    """Return a deterministic SHA-256 prefix of the schema content.
+
+    Phase 13 / GAP-01: the fingerprint lets the trace prove which schema
+    version produced an answer. Two services that load schemas at slightly
+    different times can compare fingerprints to detect drift.
+    """
+
+    digest = hashlib.sha256()
+    for table in sorted(schema.get("tables", [])):
+        digest.update(table.encode("utf-8"))
+        digest.update(b"\0")
+        for column in sorted(schema.get("columns", {}).get(table, []), key=lambda c: str(c.get("name", ""))):
+            digest.update(str(column.get("name", "")).encode("utf-8"))
+            digest.update(b"|")
+            digest.update(str(column.get("type", "")).encode("utf-8"))
+            digest.update(b"\n")
+    return digest.hexdigest()[:32]
+
+
+def invalidate_schema_cache(*, user_id: str, database: Optional[str] = None) -> int:
+    """Invalidate every cached schema for a user (and optional database).
+
+    Returns the number of cache entries dropped. Phase 13 / GAP-01.
+    """
+
+    sanitized_user = _sanitize_user_id(user_id)
+    database_prefix = f"{database}:" if database else ""
+    expected_user_token = f":{sanitized_user}:"
+    dropped = 0
+    with _SCHEMA_CACHE_LOCK:
+        for key in list(_SCHEMA_CACHE.keys()):
+            if database_prefix and not key.startswith(database_prefix):
+                continue
+            if expected_user_token not in f":{key}:":
+                continue
+            del _SCHEMA_CACHE[key]
+            dropped += 1
+    return dropped
+
+
+def invalidate_all_schema_caches() -> int:
+    """Drop every cached schema. Returns the number of entries dropped."""
+
+    with _SCHEMA_CACHE_LOCK:
+        dropped = len(_SCHEMA_CACHE)
+        _SCHEMA_CACHE.clear()
+    return dropped
 
 
 @dataclass(frozen=True)
@@ -131,6 +201,7 @@ def _build_loaded_schema(
     database: str,
     rows: list[tuple[str, str, str]],
     dataset_scope: dict[str, object] | None = None,
+    strict_scope: bool = True,
 ) -> LoadedUserSchema:
     raw_columns: dict[str, list[dict[str, str]]] = {}
     for table_raw, column_raw, col_type_raw in rows:
@@ -156,12 +227,15 @@ def _build_loaded_schema(
         columns = candidate_columns
 
     normalized_scope = normalize_dataset_context(dataset_scope)
-    validated_scope = validate_dataset_context(normalized_scope)
+    if strict_scope and has_complete_dataset_context(normalized_scope):
+        validated_scope = validate_dataset_context(normalized_scope)
+    else:
+        validated_scope = normalized_scope
     scoped_columns, _ = dataset_scope_guard(
         schema=columns,
         dataset_scope=validated_scope,
         selected_table=validated_scope.get("table_name", ""),
-        strict=True,
+        strict=bool(strict_scope and has_complete_dataset_context(validated_scope)),
     )
     columns = scoped_columns
     tables = sorted(columns.keys())
@@ -201,7 +275,8 @@ def load_user_schema(
     sanitized_user_id = _sanitize_user_id(user_id)
     database = _resolve_database_name(sanitized_user_id, config)
     normalized_scope = normalize_dataset_context(dataset_scope)
-    validated_scope = validate_dataset_context(normalized_scope)
+    enforce_strict_scope = has_complete_dataset_context(normalized_scope)
+    validated_scope = validate_dataset_context(normalized_scope) if enforce_strict_scope else normalized_scope
     scope_key = "|".join(
         sorted(
             f"{key}={value}"
@@ -233,6 +308,7 @@ def load_user_schema(
         database=database,
         rows=rows,
         dataset_scope=validated_scope,
+        strict_scope=enforce_strict_scope,
     )
 
     if config.schema_cache_ttl_seconds > 0:

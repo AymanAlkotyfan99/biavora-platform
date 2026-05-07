@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -15,16 +16,10 @@ from typing import Any, ClassVar, Dict, Literal, Optional, TypedDict
 from uuid import uuid4
 
 import whisper
-from intent_extraction.intent_extraction_task import intent_extraction_task
-from llm_app.schema_provider import get_schema
-from preprocessing_high.preprocess_high_task import preprocess_high_task
-from preprocessing_high.schemas import HighPreprocessConfig
-from preprocessing_low.preprocess_task import preprocess_text_task
-from reasoning_app.intent_classification_task import (
-    intent_classification_task,
-    route_intent_classification,
-)
-from shared.stage_contract import stage_allows_progress
+
+# Phase 12 / CRIT-19: imports for the legacy non-Dagster pipeline have been
+# removed. The Dagster pipeline pulls these dependencies through its own
+# asset modules.
 
 try:
     import redis
@@ -157,19 +152,13 @@ class LockLease:
     renew_thread: threading.Thread
 
 
-_SUPPORTED_AUDIO_EXTENSIONS = {
-    ".wav",
-    ".mp3",
-    ".m4a",
-    ".flac",
-    ".ogg",
-    ".aac",
-    ".wma",
-    ".mp4",
-    ".webm",
-    ".mpeg",
-    ".mpga",
-}
+# CRIT-11: single source of truth for the supported extension set lives in
+# ``bi_platform_shared.audio.validation``. Both voice-service (gateway) and
+# ai-service (Whisper inference) import from there so the gateway can never
+# accept a file that the inner service silently rejects.
+from bi_platform_shared.audio.validation import (
+    SUPPORTED_AUDIO_EXTENSIONS as _SUPPORTED_AUDIO_EXTENSIONS,
+)
 
 _SYSTEM_HINTS = (
     "out of memory",
@@ -386,6 +375,49 @@ def _validate_input(audio_path: str, config: PipelineConfig) -> None:
     if extension and extension not in _SUPPORTED_AUDIO_EXTENSIONS:
         raise InputValidationError(f"Unsupported audio format: {extension}")
 
+    _validate_audio_stream_readability(audio_path)
+
+
+def _validate_audio_stream_readability(audio_path: str) -> None:
+    ffprobe_bin = shutil.which("ffprobe")
+    if ffprobe_bin is None:
+        raise InfrastructureError("ffprobe is missing from PATH.")
+
+    command = [
+        ffprobe_bin,
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "json",
+        audio_path,
+    ]
+    try:
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=20, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise InputValidationError("Audio validation failed: ffprobe timed out while reading the file.") from exc
+    except OSError as exc:
+        raise InfrastructureError(f"ffprobe execution failed: {exc}") from exc
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        short_detail = detail.splitlines()[0][:240] if detail else "unknown ffprobe error"
+        raise InputValidationError(f"Audio validation failed: ffprobe could not decode the file ({short_detail}).")
+
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise InfrastructureError("Audio validation failed: ffprobe returned invalid JSON output.") from exc
+
+    streams = payload.get("streams", []) if isinstance(payload, dict) else []
+    has_audio_stream = any(
+        isinstance(stream, dict) and str(stream.get("codec_type", "")).strip().lower() == "audio"
+        for stream in streams
+    )
+    if not has_audio_stream:
+        raise InputValidationError("Audio validation failed: file does not contain a readable audio stream.")
+
 
 def _validate_infrastructure() -> None:
     if shutil.which("ffmpeg") is None:
@@ -397,6 +429,9 @@ class WhisperModelManager:
     _shared_model: ClassVar[Any] = None
     _shared_model_name: ClassVar[Optional[str]] = None
     _shared_model_lock: ClassVar[threading.Lock] = threading.Lock()
+    # Phase 13 / GAP-07: serialize Whisper inference — the openai-whisper
+    # runtime is not safe for concurrent ``transcribe`` on one model.
+    _inference_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self, config: PipelineConfig, logger: logging.Logger) -> None:
         self._config = config
@@ -462,9 +497,10 @@ class WhisperModelManager:
 
         started = time.perf_counter()
         try:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(model.transcribe, request.audio_path, **kwargs)
-                result = future.result(timeout=self._config.inference_timeout_seconds)
+            with self.__class__._inference_lock:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(model.transcribe, request.audio_path, **kwargs)
+                    result = future.result(timeout=self._config.inference_timeout_seconds)
         except FutureTimeoutError as exc:
             raise ModelTimeoutError(
                 f"Inference timeout after {self._config.inference_timeout_seconds}s."
@@ -1010,6 +1046,11 @@ def whisper_transcription_flow(
         )
 
 
+# Phase 12 / CRIT-19: ``_run_legacy_whisper_transcription_preprocess_intent``
+# was the non-Dagster fallback. It has been removed in favour of a single
+# Dagster orchestration path. The stub below is intentionally left so any
+# stale call site fails fast with a clear error instead of silently
+# re-introducing the legacy code path.
 def _run_legacy_whisper_transcription_preprocess_intent(
     *,
     audio_path: str,
@@ -1018,145 +1059,11 @@ def _run_legacy_whisper_transcription_preprocess_intent(
     initial_prompt: Optional[str],
     user_id: Optional[str],
 ) -> dict[str, Any]:
-    transcription_result = transcribe_audio_task(
-        audio_path=audio_path,
-        request_id=request_id,
-        language=language,
-        initial_prompt=initial_prompt,
+    raise RuntimeError(
+        "Legacy non-Dagster pipeline has been removed (Phase 12 / CRIT-19). "
+        "Use whisper_transcription_preprocess_intent_flow which routes through "
+        "the Dagster pipeline."
     )
-    if transcription_result["status"] != "success":
-        return {
-            "status": "failed",
-            "stage": "transcription",
-            "transcription": transcription_result,
-        }
-
-    preprocess_result = preprocess_text_task(text=transcription_result["text"])
-    if not stage_allows_progress(preprocess_result.get("status"), degraded=bool(preprocess_result.get("degraded"))):
-        return {
-            "status": "failed",
-            "stage": "preprocess",
-            "transcription": transcription_result,
-            "preprocess": preprocess_result,
-        }
-
-    intent_result = intent_classification_task(cleaned_text=preprocess_result["cleaned_text"])
-    if not stage_allows_progress(intent_result.get("status"), degraded=bool(intent_result.get("degraded"))):
-        return {
-            "status": "failed",
-            "stage": "intent_classification",
-            "transcription": transcription_result,
-            "preprocess": preprocess_result,
-            "intent": intent_result,
-        }
-
-    routing_result = route_intent_classification(
-        cleaned_text=preprocess_result["cleaned_text"],
-        classification_result=intent_result,
-        user_id=str(user_id or "").strip(),
-    )
-
-    if routing_result.get("status") == "rejected":
-        return routing_result
-
-    if not stage_allows_progress(routing_result.get("status"), degraded=bool(routing_result.get("degraded"))):
-        return {
-            "status": "failed",
-            "stage": "routing",
-            "transcription": transcription_result,
-            "preprocess": preprocess_result,
-            "intent": intent_result,
-            "routing": routing_result,
-        }
-
-    payload = routing_result.get("payload", {}) or {}
-    effective_user_id = str(payload.get("user_id") or "").strip()
-    if not effective_user_id:
-        effective_user_id = HighPreprocessConfig.from_env().default_user_id
-
-    preprocess_high_result = preprocess_high_task(
-        cleaned_text=payload.get("cleaned_text", preprocess_result["cleaned_text"]),
-        user_id=effective_user_id,
-        route=str(routing_result.get("route", "analytical")).strip().lower() or "analytical",
-    )
-
-    if preprocess_high_result.get("status") == "rejected":
-        return {
-            "status": "rejected",
-            "stage": "preprocessing_high",
-            "message": preprocess_high_result.get(
-                "message",
-                "The requested column does not exist in your data.",
-            ),
-            "transcription": transcription_result,
-            "preprocess": preprocess_result,
-            "intent": intent_result,
-            "routing": routing_result,
-            "preprocess_high": preprocess_high_result,
-        }
-
-    if not stage_allows_progress(
-        preprocess_high_result.get("status"),
-        degraded=bool(preprocess_high_result.get("degraded")),
-    ):
-        return {
-            "status": "failed",
-            "stage": "preprocessing_high",
-            "transcription": transcription_result,
-            "preprocess": preprocess_result,
-            "intent": intent_result,
-            "routing": routing_result,
-            "preprocess_high": preprocess_high_result,
-        }
-
-    try:
-        schema_snapshot = get_schema()
-    except Exception as exc:  # noqa: BLE001
-        return {
-            "status": "failed",
-            "stage": "intent_extraction",
-            "message": f"Failed to load schema for intent extraction: {exc}",
-            "transcription": transcription_result,
-            "preprocess": preprocess_result,
-            "intent": intent_result,
-            "routing": routing_result,
-            "preprocess_high": preprocess_high_result,
-        }
-
-    intent_extraction_result = intent_extraction_task(
-        query=preprocess_high_result["final_query"],
-        schema=schema_snapshot,
-    )
-    if not stage_allows_progress(
-        intent_extraction_result.get("status"),
-        degraded=bool(intent_extraction_result.get("degraded")),
-    ):
-        return {
-            "status": "failed",
-            "stage": "intent_extraction",
-            "transcription": transcription_result,
-            "preprocess": preprocess_result,
-            "intent": intent_result,
-            "routing": routing_result,
-            "preprocess_high": preprocess_high_result,
-            "intent_extraction": intent_extraction_result,
-        }
-
-    return {
-        "status": "degraded"
-        if any(
-            bool(stage.get("degraded"))
-            for stage in (preprocess_result, intent_result, preprocess_high_result, intent_extraction_result)
-            if isinstance(stage, dict)
-        )
-        else "success",
-        "transcription": transcription_result,
-        "preprocess": preprocess_result,
-        "intent": intent_result,
-        "routing": routing_result,
-        "preprocess_high": preprocess_high_result,
-        "intent_extraction": intent_extraction_result,
-    }
 
 
 def whisper_transcription_preprocess_intent_flow(
@@ -1176,7 +1083,13 @@ def whisper_transcription_preprocess_intent_flow(
     Dagster orchestration entrypoint for:
     transcription -> preprocessing_low -> intent_classification
     -> preprocessing_high -> intent_extraction -> routing/execution/downstream.
+
+    Phase 12 / CRIT-19: the legacy non-Dagster fallback has been removed.
+    There is exactly one pipeline; if it fails the request fails fast with
+    a structured ``dagster_orchestration`` error rather than silently
+    routing through a code path that no longer receives maintenance.
     """
+
     try:
         from dagster_pipeline.jobs import run_full_ai_pipeline
 
@@ -1195,35 +1108,23 @@ def whisper_transcription_preprocess_intent_flow(
         )
     except Exception as exc:  # noqa: BLE001
         logger = _get_logger()
-        legacy_fallback_enabled = str(
-            os.getenv("AI_SERVICE_ENABLE_LEGACY_FALLBACK", "false")
-        ).strip().lower() in {"1", "true", "yes", "on"}
         _log_event(
             logger,
             logging.ERROR,
             "Dagster full pipeline orchestration failed",
             error=str(exc),
-            legacy_fallback_enabled=legacy_fallback_enabled,
             audio_path=audio_path,
         )
-        if not legacy_fallback_enabled:
-            return {
-                "status": "failed",
-                "stage": "dagster_orchestration",
-                "message": "Dagster full pipeline orchestration failed.",
-                "error_type": "system",
-                "action_taken": "stop",
-                "final_route": "stop",
-                "final_user_message": "AI orchestration failed before analytical routing.",
-                "debug_metadata": {"legacy_fallback_enabled": False, "error": str(exc)},
-            }
-        return _run_legacy_whisper_transcription_preprocess_intent(
-            audio_path=audio_path,
-            request_id=request_id,
-            language=language,
-            initial_prompt=initial_prompt,
-            user_id=user_id,
-        )
+        return {
+            "status": "failed",
+            "stage": "dagster_orchestration",
+            "message": "Dagster full pipeline orchestration failed.",
+            "error_type": "system",
+            "action_taken": "stop",
+            "final_route": "stop",
+            "final_user_message": "AI orchestration failed before analytical routing.",
+            "debug_metadata": {"error": str(exc)},
+        }
 
 
 def full_audio_transcription(audio_bytes: bytes) -> str:
@@ -1246,4 +1147,3 @@ def full_audio_transcription(audio_bytes: bytes) -> str:
     finally:
         if os.path.exists(tmp_audio_path):
             os.remove(tmp_audio_path)
-

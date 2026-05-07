@@ -3,7 +3,7 @@ import { Link, useSearchParams, useNavigate } from 'react-router-dom'
 import { CheckCircle, XCircle, UserPlus, Loader2 } from 'lucide-react'
 import { workspaceAPI } from '../../api/endpoints'
 import { useAuthStore } from '../../store/auth'
-import toast from 'react-hot-toast'
+import { toast } from 'react-toastify'
 import Button from '../../components/Button'
 import AnimatedPage from '../../components/AnimatedPage'
 

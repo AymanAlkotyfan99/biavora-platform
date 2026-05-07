@@ -1,3 +1,22 @@
+"""LLM-driven structured intent extractor (Phase 5 / CRIT-14).
+
+Phase 5 of the audit consolidates intent extraction around three principles:
+
+1. **Single source of truth for predictive detection** – the local
+   ``_PREDICTIVE_KEYWORDS`` and ``_FUTURE_TIME_PATTERNS`` tables that
+   competed with the rest of the platform have been removed; predictive
+   inference now flows through
+   ``bi_platform_shared.predictive.detector.is_predictive``.
+
+2. **Dynamic chart taxonomy** – the previously-hardcoded list of legal
+   chart types is replaced by ``ChartTypeEnum``; that enum is the *only*
+   taxonomy the platform recognises.
+
+3. **JSON schema discipline** – the LLM prompt now enumerates the legal
+   chart values directly from ``ChartTypeEnum.values()`` so the model can
+   never invent a new chart token.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -7,74 +26,26 @@ from typing import Any, Callable
 
 import requests
 
+try:  # pragma: no cover
+    from bi_platform_shared.http import HttpClientError, get_default_client
+    _SHARED_CLIENT_AVAILABLE = True
+except Exception:  # pragma: no cover
+    HttpClientError = Exception  # type: ignore[assignment,misc]
+    _SHARED_CLIENT_AVAILABLE = False
+
+from bi_platform_shared.contracts.chart import ChartTypeEnum
+from bi_platform_shared.predictive.detector import is_predictive
+
 from intent_extraction.error_handler import (
     IntentExtractionModelOutputError,
     IntentExtractionSystemError,
 )
 from intent_extraction.schemas import IntentExtractionConfig, IntentType, StructuredIntent
 from llm_app.response_parser import safe_json_parse
+from shared.bi_llm_core_policy import STRICT_BI_LLM_CORE_POLICY
 from shared.query_planner import normalize_analytical_intent
+from shared.bi_llm_core_policy import STRICT_BI_LLM_CORE_POLICY
 
-
-_PREDICTIVE_KEYWORDS = (
-    # English
-    "forecast",
-    "predict",
-    "prediction",
-    "projected",
-    "projection",
-    "expected",
-    "expectation",
-    "future",
-    "next",
-    "upcoming",
-    "what will",
-    # Arabic
-    "توقع",
-    "تنبؤ",
-    "متوقع",
-    "المستقبل",
-    "القادم",
-    "المقبل",
-    # French
-    "prevision",
-    "prévision",
-    "predire",
-    "prédire",
-    "avenir",
-    "prochain",
-    # Spanish
-    "pronostico",
-    "pronóstico",
-    "prediccion",
-    "predicción",
-    "predecir",
-    "futuro",
-    "proximo",
-    "próximo",
-    # German
-    "prognose",
-    "vorhersage",
-    "zukunft",
-    "naechste",
-    "nächste",
-    # Turkish
-    "tahmin",
-    "ongoru",
-    "öngörü",
-    "gelecek",
-    # Hindi
-    "पूर्वानुमान",
-)
-
-_FUTURE_TIME_PATTERNS = (
-    r"\bnext\s+(week|month|quarter|year)\b",
-    r"\bupcoming\s+(week|month|quarter|year)\b",
-    r"\bcoming\s+(week|month|quarter|year)\b",
-    r"\bin\s+\d+\s+(day|days|week|weeks|month|months|quarter|quarters|year|years)\b",
-    r"\bwhat\s+will\s+be\b",
-    r"\btrend\b.*\bnext\b",
-)
 
 _VALID_INTENT_TYPES = {"analytical", "predictive"}
 _RELATIONSHIP_KEYWORDS = (
@@ -87,6 +58,32 @@ _RELATIONSHIP_KEYWORDS = (
     "vs",
     "versus",
 )
+_PERCENTAGE_SHARE_KEYWORDS = (
+    "percentage",
+    "percent",
+    "share",
+    "ratio",
+    "proportion",
+    "composition",
+    "distribution",
+    "%",
+)
+_PIE_KEYWORDS = ("pie", "donut", "doughnut")
+
+
+def _allowed_chart_values() -> set[str]:
+    """All canonical chart-type tokens the platform recognises.
+
+    Driven by ``ChartTypeEnum`` so adding a new chart in the shared
+    contract automatically widens the LLM and the validator without code
+    duplication.
+    """
+
+    return {member.value for member in ChartTypeEnum}
+
+
+def _allowed_chart_prompt_list() -> str:
+    return "|".join(sorted(_allowed_chart_values())) + "|null"
 
 
 def _schema_to_prompt(schema: dict[str, list[dict[str, Any]]]) -> str:
@@ -101,7 +98,10 @@ def _schema_to_prompt(schema: dict[str, list[dict[str, Any]]]) -> str:
 
 
 def _build_extraction_prompt(*, query: str, schema: dict[str, list[dict[str, Any]]]) -> str:
+    chart_options = _allowed_chart_prompt_list()
     return f"""
+{STRICT_BI_LLM_CORE_POLICY}
+
 You are a domain-agnostic semantic intent extraction engine for BI and analytics.
 
 Your job:
@@ -118,6 +118,15 @@ Hard constraints:
 - If query implies comparisons (above, below, greater than, less than, more than, fewer than, >=, <=, =), map them into filters with explicit operators.
 - If query asks multiple outputs ("A and B", "X with Y"), include all relevant metrics in both metrics and metric_specs.
 - If aggregation intent appears (sum/total, avg/mean, count), set metric_specs.aggregation and aggregation accordingly.
+- If query asks for pie/donut/share/percentage/composition/proportion, include chart.type="pie".
+- If query asks for distribution/spread/frequency/histogram, include chart.type="histogram"; never map distribution to pie.
+- If query asks for percentage/share, include chart.metric_type="percentage" and top-level metric_type="percentage".
+- If the user mentions percentage, percent, or share -> set metric_type="percentage".
+- If the user mentions distribution, preserve distribution semantics and set chart.type="histogram".
+- If the user mentions pie or pie chart -> set chart.type="pie".
+- Always include chart, metric_type, selected_chart_type, and chart_type in the output object.
+- selected_chart_type and chart_type must mirror chart.type (or be null if chart.type is null).
+- chart.type, selected_chart_type and chart_type MUST be one of: {chart_options}.
 - If unsure, choose safest valid values but keep structure complete.
 
 Schema:
@@ -143,7 +152,15 @@ Return exactly one JSON object with these keys:
   "limit": 1,
   "ranking": {{"direction": "ASC|DESC|null", "requested": true, "source": "query|model"}},
   "operations": ["projection", "aggregation", "grouping", "filtering", "ranking", "limiting", "comparison"],
-  "ambiguities": [{{"type": "string", "message": "string"}}]
+  "ambiguities": [{{"type": "string", "message": "string"}}],
+  "chart": {{
+    "type": "{chart_options}",
+    "metric_type": "percentage|absolute|ratio|null",
+    "group_by": "dimension name or null"
+  }},
+  "metric_type": "percentage|absolute|ratio|null",
+  "selected_chart_type": "{chart_options}",
+  "chart_type": "{chart_options}"
 }}
 
 User query:
@@ -313,6 +330,42 @@ def _is_relationship_query(query: str) -> bool:
     return bool(re.search(r"\bbetween\b.+\band\b", lowered))
 
 
+def _detect_chart_semantics(query: str, payload: dict[str, Any]) -> tuple[str, str]:
+    """Detect chart semantics using the canonical ``ChartTypeEnum`` taxonomy.
+
+    Phase 5 / CRIT-14: the prior hardcoded chart whitelist has been replaced
+    by ``ChartTypeEnum.values()`` so the platform stays consistent if the
+    enum grows.
+    """
+
+    lowered_query = str(query or "").strip().lower()
+    payload_chart = payload.get("chart") if isinstance(payload.get("chart"), dict) else {}
+    payload_chart_type = (
+        str(payload.get("selected_chart_type", "")).strip().lower()
+        or str(payload.get("chart_type", "")).strip().lower()
+        or str(payload_chart.get("type", "")).strip().lower()
+    )
+    payload_metric_type = (
+        str(payload_chart.get("metric_type", "")).strip().lower()
+        or str(payload.get("metric_type", "")).strip().lower()
+    )
+
+    allowed_chart_types = _allowed_chart_values()
+    chart_type = payload_chart_type if payload_chart_type in allowed_chart_types else ""
+    metric_type = payload_metric_type if payload_metric_type in {"percentage", "absolute", "ratio"} else ""
+
+    if any(keyword in lowered_query for keyword in ("distribution", "histogram", "spread", "frequency")):
+        chart_type = ChartTypeEnum.HISTOGRAM.value
+    if not metric_type and any(keyword in lowered_query for keyword in ("percentage", "percent", "share", "ratio", "proportion", "composition", "%")):
+        metric_type = "percentage"
+    if not chart_type and (
+        any(keyword in lowered_query for keyword in _PIE_KEYWORDS)
+        or (metric_type == "percentage" and any(keyword in lowered_query for keyword in _PERCENTAGE_SHARE_KEYWORDS))
+    ):
+        chart_type = ChartTypeEnum.PIE.value
+    return chart_type, metric_type
+
+
 def _relationship_ready_metrics(
     *,
     candidates: list[str],
@@ -363,6 +416,10 @@ def _enrich_with_semantic_ir(
         "limit": intent_payload.get("limit"),
         "ranking": intent_payload.get("ranking", {}),
         "ambiguities": intent_payload.get("ambiguities", []),
+        "chart": intent_payload.get("chart", {}),
+        "metric_type": intent_payload.get("metric_type", ""),
+        "selected_chart_type": intent_payload.get("selected_chart_type", ""),
+        "chart_type": intent_payload.get("chart_type", ""),
     }
 
     try:
@@ -471,23 +528,30 @@ def _enrich_with_semantic_ir(
         "ranking": normalized.get("ranking", {}) if isinstance(normalized.get("ranking"), dict) else {},
         "operations": normalized.get("operations", []) if isinstance(normalized.get("operations"), list) else [],
         "ambiguities": normalized.get("ambiguities", []) if isinstance(normalized.get("ambiguities"), list) else [],
+        "chart": intent_payload.get("chart", {}) if isinstance(intent_payload.get("chart"), dict) else {},
+        "metric_type": str(intent_payload.get("metric_type", "")).strip().lower(),
+        "selected_chart_type": str(intent_payload.get("selected_chart_type", "")).strip().lower(),
+        "chart_type": str(intent_payload.get("chart_type", "")).strip().lower(),
     }
 
 
 def infer_intent_type(*, query: str, hinted_intent_type: str | None = None) -> IntentType:
+    """Decide whether a question is analytical or predictive.
+
+    Phase 5 / CRIT-14: the local predictive keyword and pattern lists were
+    deleted. Predictive detection now uses the canonical shared detector at
+    ``bi_platform_shared.predictive.detector.is_predictive`` which carries
+    the platform-wide multilingual keyword set.
+    """
+
     hinted = (hinted_intent_type or "").strip().lower()
     if hinted in _VALID_INTENT_TYPES:
         return hinted  # type: ignore[return-value]
 
-    lowered = (query or "").lower()
-
-    if any(keyword in lowered for keyword in _PREDICTIVE_KEYWORDS):
+    if is_predictive(str(query or "")):
         return "predictive"
 
-    for pattern in _FUTURE_TIME_PATTERNS:
-        if re.search(pattern, lowered):
-            return "predictive"
-
+    lowered = (query or "").lower()
     current_year = datetime.now(timezone.utc).year
     for match in re.findall(r"\b(19\d{2}|20\d{2}|21\d{2})\b", lowered):
         if int(match) > current_year:
@@ -508,15 +572,25 @@ def _call_ollama(
     }
 
     try:
-        response = requests.post(
-            config.ollama_url,
-            json=payload,
-            timeout=config.request_timeout_seconds,
-        )
+        if _SHARED_CLIENT_AVAILABLE:
+            response = get_default_client().post(
+                config.ollama_url,
+                json=payload,
+                timeout=(min(5.0, float(config.request_timeout_seconds)), float(config.request_timeout_seconds)),
+                attach_internal_api_key=False,
+            )
+        else:
+            response = requests.post(
+                config.ollama_url,
+                json=payload,
+                timeout=config.request_timeout_seconds,
+            )
     except requests.Timeout as exc:
         raise IntentExtractionSystemError(
             f"Ollama timeout after {config.request_timeout_seconds}s."
         ) from exc
+    except HttpClientError as exc:  # type: ignore[misc]
+        raise IntentExtractionSystemError(f"Ollama HTTP request failed: {exc}") from exc
     except requests.RequestException as exc:
         raise IntentExtractionSystemError(f"Ollama request failed: {exc}") from exc
 
@@ -608,6 +682,13 @@ def extract_structured_intent(
         query=query,
         hinted_intent_type=str(payload.get("intent_type", "")).strip(),
     )
+    selected_chart_type, metric_type = _detect_chart_semantics(query, payload)
+    chart_group_by = None
+    if dimensions:
+        chart_group_by = dimensions[0]
+    payload_chart = payload.get("chart") if isinstance(payload.get("chart"), dict) else {}
+    if payload_chart.get("group_by"):
+        chart_group_by = str(payload_chart.get("group_by")).strip() or chart_group_by
 
     intent_payload: StructuredIntent = {
         "intent_type": intent_type,
@@ -625,6 +706,14 @@ def extract_structured_intent(
         "ranking": payload.get("ranking") if isinstance(payload.get("ranking"), dict) else {},
         "operations": payload.get("operations") if isinstance(payload.get("operations"), list) else [],
         "ambiguities": payload.get("ambiguities") if isinstance(payload.get("ambiguities"), list) else [],
+        "chart": {
+            "type": selected_chart_type or None,
+            "metric_type": metric_type or None,
+            "group_by": chart_group_by or None,
+        },
+        "metric_type": metric_type,
+        "selected_chart_type": selected_chart_type,
+        "chart_type": selected_chart_type,
     }
     intent_payload = _enrich_with_semantic_ir(
         query=query,

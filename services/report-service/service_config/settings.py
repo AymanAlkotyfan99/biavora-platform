@@ -1,6 +1,7 @@
 ﻿import os
 from pathlib import Path
 from datetime import timedelta
+from django.core.exceptions import ImproperlyConfigured
 
 from dotenv import load_dotenv
 
@@ -8,9 +9,19 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / '.env')
 load_dotenv(BASE_DIR.parent.parent / '.env')
 
-SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'report-service-secret-key')
-DEBUG = os.getenv('DEBUG', 'True') == 'True'
-ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', '*').split(',')
+_raw_debug = os.getenv("DJANGO_DEBUG", os.getenv("DEBUG", "false"))
+DEBUG = str(_raw_debug).strip().lower() in {"1", "true", "yes", "on"}
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "")
+if not SECRET_KEY:
+    raise ImproperlyConfigured("DJANGO_SECRET_KEY must be set")
+
+_raw_allowed_hosts = os.getenv("DJANGO_ALLOWED_HOSTS", os.getenv("ALLOWED_HOSTS", ""))
+if _raw_allowed_hosts.strip():
+    ALLOWED_HOSTS = [host.strip() for host in _raw_allowed_hosts.split(",") if host.strip()]
+elif DEBUG:
+    ALLOWED_HOSTS = ["localhost", "127.0.0.1"]
+else:
+    ALLOWED_HOSTS = []
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -64,12 +75,14 @@ DATABASES = {
         'ENGINE': 'django.db.backends.postgresql',
         'NAME': os.getenv('DB_NAME', 'bi_voice_agent'),
         'USER': os.getenv('DB_USER', 'bi_admin'),
-        'PASSWORD': os.getenv('DB_PASSWORD', 'StrongPassword123'),
+        'PASSWORD': os.getenv('DB_PASSWORD', ''),
         'HOST': os.getenv('DB_HOST', 'postgres-report'),
         'PORT': os.getenv('DB_PORT', '5432'),
         'CONN_MAX_AGE': 600,
     }
 }
+if not DATABASES["default"]["PASSWORD"]:
+    raise ImproperlyConfigured("DB_PASSWORD must be set")
 
 AUTH_USER_MODEL = 'users.User'
 
@@ -120,5 +133,20 @@ METABASE_PASSWORD = os.getenv('METABASE_PASSWORD', '')
 METABASE_DATABASE_ID = int(os.getenv('METABASE_DATABASE_ID', '2'))
 METABASE_SECRET_KEY = os.getenv('METABASE_SECRET_KEY', '')
 
-CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_ALL_ORIGINS = False
 CORS_ALLOW_CREDENTIALS = True
+_raw_cors_allowed_origins = os.getenv("DJANGO_CORS_ALLOWED_ORIGINS", os.getenv("CORS_ALLOWED_ORIGINS", ""))
+CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in _raw_cors_allowed_origins.split(",")
+    if origin.strip()
+]
+if DEBUG and not CORS_ALLOWED_ORIGINS:
+    CORS_ALLOWED_ORIGINS = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+if CORS_ALLOW_CREDENTIALS and not DEBUG and not CORS_ALLOWED_ORIGINS:
+    raise ImproperlyConfigured(
+        "DJANGO_CORS_ALLOWED_ORIGINS (or CORS_ALLOWED_ORIGINS) must be set when credentials are enabled."
+    )

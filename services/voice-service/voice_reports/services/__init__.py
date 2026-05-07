@@ -1,41 +1,19 @@
-from .small_whisper_client import SmallWhisperClient, get_small_whisper_client
-from .clickhouse_executor import (
-    ClickHouseExecutor,
-    get_clickhouse_executor,
-    sanitize_query_results,
-    sanitize_numeric_value
-)
-from .sql_guard import SQLGuard
-from .metabase_service import (
-    MetabaseService,
-    get_metabase_service,
-    get_metabase_session,
-    get_metabase_headers,
-)
-from .jwt_embedding import JWTEmbeddingService, get_jwt_service
-from .event_bus import KafkaEventPublisher, get_event_publisher
+"""Active voice-service helpers.
+
+Per CRIT-04 the local SQLGuard was removed from voice-service: SQL safety
+is enforced exclusively inside query-service via ``/query/validate/``.
+
+Per CRIT-12 ``small_whisper_client`` was renamed to ``ai_service_client``
+and ``SmallWhisperClient`` was renamed to ``AIServiceClient``. The previous
+module is gone — every import has been migrated.
+"""
+
+from .ai_service_client import AIServiceClient, get_ai_service_client
 from .subscription_client import SubscriptionClient, get_subscription_client
-from .notification_client import NotificationClient, get_notification_client
 
 __all__ = [
-    'SmallWhisperClient',
-    'get_small_whisper_client',
-    'ClickHouseExecutor',
-    'get_clickhouse_executor',
-    'sanitize_query_results',
-    'sanitize_numeric_value',
-    'SQLGuard',
-    'MetabaseService',
-    'get_metabase_service',
-    'get_metabase_session',
-    'get_metabase_headers',
-    'JWTEmbeddingService',
-    'get_jwt_service',
-    'KafkaEventPublisher',
-    'get_event_publisher',
-    'SubscriptionClient',
-    'get_subscription_client',
-    'NotificationClient',
-    'get_notification_client',
+    "AIServiceClient",
+    "get_ai_service_client",
+    "SubscriptionClient",
+    "get_subscription_client",
 ]
-

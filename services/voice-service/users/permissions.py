@@ -1,48 +1,23 @@
 """
-Custom Permission Classes
+voice-service users.permissions
+===============================
 
-Role-based permissions for the BI system.
+Per CRIT-20 the permission classes live in ``bi_platform_shared`` and are
+re-exported from this module unchanged so existing imports keep working.
 """
 
-from rest_framework.permissions import BasePermission
+from bi_platform_shared.permissions.roles import (
+    IsAdmin,
+    IsAnalyst,
+    IsExecutive,
+    IsManager,
+    IsManagerOrAnalyst,
+)
 
-
-class IsManager(BasePermission):
-    """
-    Permission class to allow only managers.
-    """
-    
-    def has_permission(self, request, view):
-        return request.user and request.user.is_authenticated and request.user.role == 'manager'
-
-
-class IsAnalyst(BasePermission):
-    """
-    Permission class to allow only analysts.
-    """
-    
-    def has_permission(self, request, view):
-        return request.user and request.user.is_authenticated and request.user.role == 'analyst'
-
-
-class IsExecutive(BasePermission):
-    """
-    Permission class to allow only executives.
-    """
-    
-    def has_permission(self, request, view):
-        return request.user and request.user.is_authenticated and request.user.role == 'executive'
-
-
-class IsManagerOrAnalyst(BasePermission):
-    """
-    Permission class to allow managers or analysts.
-    """
-    
-    def has_permission(self, request, view):
-        return (
-            request.user and 
-            request.user.is_authenticated and 
-            request.user.role in ['manager', 'analyst']
-        )
-
+__all__ = [
+    "IsAdmin",
+    "IsAnalyst",
+    "IsExecutive",
+    "IsManager",
+    "IsManagerOrAnalyst",
+]

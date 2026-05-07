@@ -10,8 +10,17 @@ load_dotenv(BASE_DIR.parent.parent / '.env')
 load_dotenv(BASE_DIR.parent.parent / '.env.microservices')
 
 SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'auth-service-secret-key')
-DEBUG = os.getenv('DEBUG', 'True') == 'True'
-ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', '*').split(',')
+
+# Phase 11 / CRIT-15: production-safe DEBUG and ALLOWED_HOSTS defaults.
+DEBUG = str(os.getenv('DEBUG', 'False')).strip().lower() in {"1", "true", "yes", "on"}
+
+_raw_allowed_hosts = os.getenv('ALLOWED_HOSTS', '').strip()
+if _raw_allowed_hosts:
+    ALLOWED_HOSTS = [host.strip() for host in _raw_allowed_hosts.split(',') if host.strip()]
+elif DEBUG:
+    ALLOWED_HOSTS = ['localhost', '127.0.0.1']
+else:
+    ALLOWED_HOSTS = []
 
 INSTALLED_APPS = [
     'django.contrib.admin',

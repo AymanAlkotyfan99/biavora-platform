@@ -1,14 +1,207 @@
+"""SQL review and correction stage (Phase 6 / CRIT-04 + CRIT-05).
+
+Phase 6 of the audit hardens this module against three classes of bug:
+
+1. **Predictive duplication** – the local ``_PREDICTIVE_PATTERNS`` tuple has
+   been removed; the canonical detector at
+   ``bi_platform_shared.predictive.detector.is_predictive`` is now the only
+   place those patterns live.
+2. **LLM SQL safety** – every variant of LLM-corrected SQL is validated via
+   ``query-service /query/validate/`` (already centralised in CRIT-04). If
+   that validation fails OR the SQL is misaligned with the validated IR,
+   we fall back to the compiler SQL instead of raising an exception that
+   would tear the pipeline down.
+3. **Tenant qualification** – the LLM never sees a bare table name; the
+   compiler now emits per-tenant qualified FROMs and the alignment check
+   accepts both qualified and unqualified forms so a faithful LLM rewrite
+   does not get rejected just for repeating the qualifier.
+"""
+
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import re
+import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator, Tuple
 
 import requests
 
-from shared.sql_validator import validate_sql
+from bi_platform_shared.http import HttpClientError, get_default_client
+from bi_platform_shared.predictive.detector import is_predictive
+
+
+logger = logging.getLogger(__name__)
+
+
+_VALIDATION_CACHE: dict[str, tuple[bool, str]] = {}
+
+_validation_workspace_id_var: ContextVar[str] = ContextVar("_validation_workspace_id", default="")
+_validation_bearer_token_var: ContextVar[str] = ContextVar("_validation_bearer_token", default="")
+_query_service_auth_status_var: ContextVar[str] = ContextVar("_query_service_auth_status", default="")
+
+
+def get_last_query_service_auth_status() -> str:
+    """Auth outcome of the most recent query-service validate call (for pipeline trace)."""
+
+    return str(_query_service_auth_status_var.get() or "").strip()
+
+
+def _set_query_service_auth_status(value: str) -> None:
+    _query_service_auth_status_var.set(str(value or "").strip())
+
+
+@contextmanager
+def query_validate_request_context(*, workspace_id: str, bearer_token: str) -> Iterator[None]:
+    """Bind workspace_id and Bearer token for nested :func:`validate_sql` / ``_query_service_validate`` calls."""
+
+    token = str(bearer_token or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    wid_reset = _validation_workspace_id_var.set(str(workspace_id or "").strip())
+    tok_reset = _validation_bearer_token_var.set(token)
+    try:
+        yield
+    finally:
+        _validation_workspace_id_var.reset(wid_reset)
+        _validation_bearer_token_var.reset(tok_reset)
+
+
+def _validation_workspace_id() -> str:
+    return str(_validation_workspace_id_var.get() or "").strip()
+
+
+def _validation_bearer_token() -> str:
+    return str(_validation_bearer_token_var.get() or "").strip()
+
+
+def bind_query_service_validation_for_pipeline(*, workspace_id: str, bearer_token: str) -> Tuple[Any, Any]:
+    """Set validation ContextVars; pair with :func:`reset_query_service_validation_for_pipeline`."""
+
+    token = str(bearer_token or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    return (
+        _validation_workspace_id_var.set(str(workspace_id or "").strip()),
+        _validation_bearer_token_var.set(token),
+    )
+
+
+def reset_query_service_validation_for_pipeline(handles: Tuple[Any, Any]) -> None:
+    _validation_workspace_id_var.reset(handles[0])
+    _validation_bearer_token_var.reset(handles[1])
+
+
+def _query_service_validate(sql: str) -> tuple[bool, str]:
+    """Call query-service /query/validate/ and cache for the pipeline run.
+
+    The cache is keyed on the SHA-256 of the SQL so the same compiler-emitted
+    SQL is not re-validated multiple times within one pipeline run.
+    """
+
+    if not sql:
+        return False, "sql is empty"
+    sql_hash = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+    cached = _VALIDATION_CACHE.get(sql_hash)
+    if cached is not None:
+        return cached
+
+    endpoint = f"{os.getenv('QUERY_SERVICE_URL', 'http://query-service:8006').rstrip('/')}/query/validate/"
+    workspace_id = _validation_workspace_id() or str(os.getenv("QUERY_SERVICE_WORKSPACE_ID", "") or "").strip()
+    ctx_bearer = _validation_bearer_token()
+    from shared.query_service_auth import bearer_matches_configured_internal_secret, require_query_service_bearer_token
+
+    bearer = str(ctx_bearer or "").strip()
+    if not bearer:
+        try:
+            bearer = require_query_service_bearer_token()
+        except RuntimeError as exc:
+            _set_query_service_auth_status("auth_not_configured")
+            logger.error(
+                "query_service_validate_missing_auth",
+                extra={"hint": str(exc)},
+            )
+            _VALIDATION_CACHE[sql_hash] = (False, "query_service_auth_not_configured")
+            return False, "query_service_auth_not_configured"
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {bearer}",
+    }
+    if bearer_matches_configured_internal_secret(bearer):
+        headers["X-Internal-Service"] = "ai-service"
+    payload: dict[str, Any] = {"sql": sql}
+    if workspace_id:
+        payload["workspace_id"] = workspace_id
+    if not workspace_id:
+        logger.warning(
+            "query_service_validate_missing_workspace",
+            extra={"hint": "Set QUERY_SERVICE_WORKSPACE_ID or query_validate_request_context(workspace_id=...)."},
+        )
+    try:
+        response = get_default_client().post(
+            endpoint,
+            json=payload,
+            headers=headers,
+            timeout=(5.0, float(os.getenv("AI_SERVICE_QUERY_VALIDATE_TIMEOUT", "15"))),
+            attach_internal_api_key=False,
+            request_id=str(uuid.uuid4()),
+        )
+    except HttpClientError as exc:
+        logger.warning("query_service_validate_unreachable", extra={"error": str(exc)})
+        return False, "query_service_unreachable"
+    if response.status_code in (401, 403):
+        err_txt = ""
+        try:
+            err_json = response.json()
+            err_txt = str(err_json.get("error") or err_json.get("detail") or err_json or "")
+        except ValueError:
+            err_txt = (response.text or "")[:500]
+        lowered = err_txt.lower()
+        if response.status_code == 401 or (
+            "database_mismatch" not in lowered
+            and "cross_db" not in lowered
+            and (
+                "token" in lowered
+                or "auth" in lowered
+                or "not authenticated" in lowered
+                or "credentials" in lowered
+                or "permission denied" in lowered
+            )
+        ):
+            _set_query_service_auth_status("auth_invalid")
+            return False, "query_service_unauthorized"
+    if response.status_code >= 500:
+        _set_query_service_auth_status("auth_success")
+        return False, f"query_service_error:{response.status_code}"
+    try:
+        body = response.json()
+    except ValueError:
+        _set_query_service_auth_status("auth_success")
+        return False, "query_service_invalid_response"
+    ok = bool(body.get("is_valid") or body.get("safe") or body.get("success"))
+    msg = str(body.get("error") or body.get("message") or ("validation_passed" if ok else "sql_rejected"))
+    _set_query_service_auth_status("auth_success")
+    _VALIDATION_CACHE[sql_hash] = (ok, msg)
+    return ok, msg
+
+
+def validate_sql(sql: str) -> None:
+    """Replacement for the deleted regex-based shared.sql_validator.validate_sql.
+
+    The single source of SQL safety truth is now query-service. Callers that
+    used to rely on the in-process regex check now ask query-service over
+    HTTP. ``ValueError`` is preserved as the failure type so existing call
+    sites do not need to change their except-clauses.
+    """
+
+    ok, msg = _query_service_validate(sql or "")
+    if not ok:
+        raise ValueError(msg)
 
 
 _TOP_N_PATTERN = re.compile(r"\b(top|bottom)\s+(\d+)\b", flags=re.IGNORECASE)
@@ -25,16 +218,9 @@ _ROW_COUNT_PATTERNS = (
     r"\bcount of (?:rows|records|entries|transactions|days|weeks|items)\b",
     r"\bhow many (?:rows|records|entries|transactions|days|weeks|items)\b",
 )
-_PREDICTIVE_PATTERNS = (
-    r"\bforecast\b",
-    r"\bpredict\b",
-    r"\bfuture\b",
-    r"\bupcoming\b",
-    r"\bexpected\b",
-    r"\bwhat will be\b",
-    r"\btrend\b.*\bnext\b",
-    r"\bnext\s+\d+\s+(day|days|week|weeks|month|months|year|years)\b",
-)
+# Phase 6 / CRIT-06: predictive detection now flows through
+# ``bi_platform_shared.predictive.detector.is_predictive`` so this module
+# does not maintain its own local pattern list.
 
 
 @dataclass(frozen=True)
@@ -47,11 +233,24 @@ class SqlReviewConfig:
 
     @classmethod
     def from_env(cls) -> "SqlReviewConfig":
+        ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434").strip()
+        default_ollama_url = f"{ollama_host.rstrip('/')}/api/generate"
+        from shared.ollama_env import global_ollama_read_timeout_seconds
+
+        default_timeout = global_ollama_read_timeout_seconds()
+        raw_timeout = os.getenv("SQL_REVIEW_TIMEOUT_SECONDS")
+        if raw_timeout is not None and str(raw_timeout).strip():
+            try:
+                timeout_seconds = float(raw_timeout)
+            except ValueError:
+                timeout_seconds = default_timeout
+        else:
+            timeout_seconds = default_timeout
         return cls(
             provider=os.getenv("SQL_REVIEW_PROVIDER", "openrouter").strip().lower(),
-            ollama_url=os.getenv("SQL_REVIEW_OLLAMA_URL", "http://localhost:11434/api/generate").strip(),
+            ollama_url=os.getenv("SQL_REVIEW_OLLAMA_URL", default_ollama_url).strip(),
             ollama_model=os.getenv("SQL_REVIEW_OLLAMA_MODEL", "gemma3:1b").strip(),
-            timeout_seconds=float(os.getenv("SQL_REVIEW_TIMEOUT_SECONDS", "20") or "20"),
+            timeout_seconds=max(1.0, timeout_seconds),
             enabled=str(os.getenv("SQL_REVIEW_ENABLED", "true")).strip().lower() not in {"0", "false", "no"},
         )
 
@@ -68,7 +267,11 @@ def _schema_to_prompt(schema: dict[str, list[dict[str, Any]]]) -> str:
 def _build_review_prompt(
     *,
     question: str,
+    normalized_question: str,
     schema: dict[str, list[dict[str, Any]]],
+    selected_table: str,
+    selected_columns: list[str],
+    chart_contract: dict[str, Any] | None,
     generated_sql: str,
     validated_intent: dict[str, Any] | None,
     extracted_intent: dict[str, Any] | None,
@@ -89,10 +292,14 @@ def _build_review_prompt(
         '  "reason_category": "alignment|schema|safety|syntax|other",\n'
         '  "notes": ["short note 1", "short note 2"]\n'
         "}\n\n"
-        f"User question:\n{question}\n\n"
+        f"Original question:\n{question}\n\n"
+        f"Normalized question:\n{normalized_question}\n\n"
+        f"Selected table:\n{selected_table}\n\n"
+        f"Selected columns:\n{json.dumps(selected_columns, ensure_ascii=True)}\n\n"
         f"Schema:\n{_schema_to_prompt(schema)}\n\n"
         f"Extracted intent:\n{json.dumps(extracted_intent or {}, ensure_ascii=True)}\n\n"
         f"Validated intent:\n{json.dumps(validated_intent or {}, ensure_ascii=True)}\n\n"
+        f"Chart contract:\n{json.dumps(chart_contract or {}, ensure_ascii=True)}\n\n"
         f"Generated SQL:\n{generated_sql}\n\n"
         "JSON response:"
     )
@@ -118,11 +325,16 @@ def _call_openrouter(prompt: str) -> str:
 
 
 def _call_ollama(prompt: str, config: SqlReviewConfig) -> str:
-    response = requests.post(
-        config.ollama_url,
-        json={"model": config.ollama_model, "prompt": prompt, "stream": False},
-        timeout=config.timeout_seconds,
-    )
+    payload = {"model": config.ollama_model, "prompt": prompt, "stream": False}
+    try:
+        response = get_default_client().post(
+            config.ollama_url,
+            json=payload,
+            timeout=(min(5.0, float(config.timeout_seconds)), float(config.timeout_seconds)),
+            attach_internal_api_key=False,
+        )
+    except HttpClientError as exc:
+        raise requests.RequestException(str(exc)) from exc
     response.raise_for_status()
     body = response.json()
     return str(body.get("response", "")).strip()
@@ -255,10 +467,12 @@ def _is_row_count_request(question: str) -> bool:
 
 
 def _is_predictive_question(question: str) -> bool:
+    """Phase 6 / CRIT-06: delegate to the canonical shared detector."""
+
     normalized = str(question or "").strip().lower()
     if not normalized:
         return False
-    return any(re.search(pattern, normalized) for pattern in _PREDICTIVE_PATTERNS)
+    return bool(is_predictive(normalized))
 
 
 def _normalize_clickhouse_date_casts(sql: str) -> str:
@@ -274,21 +488,39 @@ def _normalize_clickhouse_date_casts(sql: str) -> str:
             normalized,
             flags=re.IGNORECASE,
         )
+    def _rewrite_ambiguous_to_date(match: re.Match[str]) -> str:
+        column_expr = str(match.group(1) or "").strip()
+        lowered = column_expr.lower()
+        if lowered in {"ds", "date", "period"} or lowered.endswith("_date"):
+            return (
+                "toDate("
+                f"coalesce(parseDateTimeBestEffortUSOrNull({column_expr}), "
+                f"parseDateTimeBestEffortOrNull({column_expr}))"
+                ")"
+            )
+        return f"toDate({column_expr})"
+
+    normalized = re.sub(
+        r"toDate\(\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\)",
+        _rewrite_ambiguous_to_date,
+        normalized,
+        flags=re.IGNORECASE,
+    )
     normalized = re.sub(
         r"toStartOfWeek\(\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\)",
-        r"toStartOfWeek(toDate(\1))",
+        r"toStartOfWeek(coalesce(parseDateTimeBestEffortUSOrNull(\1), parseDateTimeBestEffortOrNull(\1)))",
         normalized,
         flags=re.IGNORECASE,
     )
     normalized = re.sub(
         r"toStartOfMonth\(\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\)",
-        r"toStartOfMonth(toDate(\1))",
+        r"toStartOfMonth(coalesce(parseDateTimeBestEffortUSOrNull(\1), parseDateTimeBestEffortOrNull(\1)))",
         normalized,
         flags=re.IGNORECASE,
     )
     normalized = re.sub(
         r"toYear\(\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\)",
-        r"toYear(toDate(\1))",
+        r"toYear(coalesce(parseDateTimeBestEffortUSOrNull(\1), parseDateTimeBestEffortOrNull(\1)))",
         normalized,
         flags=re.IGNORECASE,
     )
@@ -331,7 +563,11 @@ def _apply_output_sanity_checks(
 def review_and_correct_sql(
     *,
     question: str,
+    normalized_question: str | None = None,
     schema: dict[str, list[dict[str, Any]]],
+    selected_table: str = "",
+    selected_columns: list[str] | None = None,
+    chart_contract: dict[str, Any] | None = None,
     generated_sql: str,
     validated_intent: dict[str, Any] | None = None,
     extracted_intent: dict[str, Any] | None = None,
@@ -368,7 +604,11 @@ def review_and_correct_sql(
 
     prompt = _build_review_prompt(
         question=question,
+        normalized_question=normalized_question or question,
         schema=schema,
+        selected_table=selected_table,
+        selected_columns=selected_columns or [],
+        chart_contract=chart_contract,
         generated_sql=generated_sql,
         validated_intent=validated_intent,
         extracted_intent=extracted_intent,
@@ -452,9 +692,20 @@ def review_and_correct_sql(
         sql=llm_sql,
         validated_intent=validated_intent,
     )
-    validate_sql(llm_sql)
+
+    # Phase 6 / CRIT-04 + CRIT-05: validate the LLM SQL via query-service.
+    # If validation fails OR the SQL drifts from the IR, fall back to the
+    # compiler SQL instead of raising. The audit explicitly forbids letting
+    # an invalid/misaligned LLM rewrite reach execution.
+    llm_sql_invalid_reason = ""
+    try:
+        validate_sql(llm_sql)
+    except ValueError as exc:
+        llm_sql_invalid_reason = str(exc)
+
     alignment_notes = _validate_sql_against_intent(llm_sql, validated_intent)
-    if alignment_notes:
+    fallback_to_compiler = bool(llm_sql_invalid_reason) or bool(alignment_notes)
+    if fallback_to_compiler:
         llm_sql = str(generated_sql or "").strip()
         llm_sql, fallback_sanity_notes = _apply_output_sanity_checks(
             question=question,
@@ -462,9 +713,22 @@ def review_and_correct_sql(
             validated_intent=validated_intent,
         )
         validate_sql(llm_sql)
-        llm_notes = [str(note) for note in llm_notes if str(note).strip()] + sanity_notes + alignment_notes + fallback_sanity_notes + [
-            "LLM correction was overridden to preserve IR semantics."
-        ]
+        fallback_messages: list[str] = []
+        if llm_sql_invalid_reason:
+            fallback_messages.append(
+                f"LLM SQL rejected by query-service: {llm_sql_invalid_reason}; reverted to compiler SQL."
+            )
+        if alignment_notes:
+            fallback_messages.extend(alignment_notes)
+            fallback_messages.append(
+                "LLM correction was overridden to preserve IR semantics."
+            )
+        llm_notes = (
+            [str(note) for note in llm_notes if str(note).strip()]
+            + sanity_notes
+            + fallback_sanity_notes
+            + fallback_messages
+        )
         llm_status = "approved"
     else:
         llm_notes = [str(note) for note in llm_notes if str(note).strip()] + sanity_notes

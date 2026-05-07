@@ -26,11 +26,20 @@ class PreprocessHighLLMError(PreprocessHighError):
 
 
 class PreprocessHighMissingColumnError(PreprocessHighError):
-    """Business rejection when a referenced column cannot be resolved."""
+    """Business rejection when a referenced column cannot be resolved.
 
-    def __init__(self, missing_column: str) -> None:
+    Phase 5 / CRIT-14: forecasting reuses this exception to surface the
+    canonical ``forecast_missing_time_column`` /
+    ``forecast_missing_target_column`` codes with a precise, user-safe
+    message.
+    """
+
+    def __init__(self, missing_column: str, message: str | None = None) -> None:
         self.missing_column = missing_column
-        super().__init__(f"The requested column does not exist in your data: {missing_column}")
+        super().__init__(
+            message
+            or f"The requested column does not exist in your data: {missing_column}"
+        )
 
 
 def classify_preprocess_high_error(exception: BaseException) -> HighPreprocessErrorType:

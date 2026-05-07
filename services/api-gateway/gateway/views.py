@@ -2,6 +2,7 @@ import logging
 import os
 
 import requests
+from bi_platform_shared.http import HttpClientError, get_default_client
 from django.http import HttpResponse, JsonResponse
 from django.utils.decorators import method_decorator
 from django.views import View
@@ -48,13 +49,28 @@ class ProxyView(View):
             headers[key] = value
 
         try:
-            upstream = requests.request(
+            upstream = get_default_client().request(
                 method=request.method,
                 url=target_url,
                 data=request.body if request.body else None,
                 headers=headers,
-                timeout=UPSTREAM_TIMEOUT_SECONDS,
+                timeout=(min(10.0, float(UPSTREAM_TIMEOUT_SECONDS)), float(UPSTREAM_TIMEOUT_SECONDS)),
+                attach_internal_api_key=False,
                 allow_redirects=False,
+            )
+        except HttpClientError as exc:
+            logger.error(
+                "Gateway upstream request failed path=%s target=%s error=%s",
+                path,
+                target.service,
+                exc,
+            )
+            return JsonResponse(
+                {
+                    "success": False,
+                    "message": f"Upstream service {target.service} unavailable.",
+                },
+                status=502,
             )
         except requests.RequestException as exc:
             logger.error(

@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { authAPI, userAPI } from '../api/endpoints'
-import toast from 'react-hot-toast'
+import { toast } from 'react-toastify'
 
 export const useAuthStore = create(
   persist(

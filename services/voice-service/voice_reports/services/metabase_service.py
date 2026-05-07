@@ -15,8 +15,33 @@ import time
 from typing import Any, Dict, Optional
 
 import requests
+from bi_platform_shared.sql import sanitize_sql_for_metabase
+
+try:  # pragma: no cover
+    from bi_platform_shared.http import HttpClientError, get_default_client
+    _SHARED_CLIENT_AVAILABLE = True
+except Exception:  # pragma: no cover
+    HttpClientError = Exception  # type: ignore[assignment,misc]
+    _SHARED_CLIENT_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+
+def _shared_request(method: str, url: str, *, headers=None, json=None, timeout=None):
+    """Helper that prefers the shared HTTP client and falls back to ``requests``."""
+
+    if _SHARED_CLIENT_AVAILABLE:
+        kwargs = {"headers": headers or {}, "attach_internal_api_key": False}
+        if json is not None and method.upper() != "GET":
+            kwargs["json"] = json
+        if timeout is not None:
+            t = float(timeout) if not isinstance(timeout, tuple) else timeout
+            kwargs["timeout"] = (min(5.0, t), t) if not isinstance(t, tuple) else t
+        return get_default_client().request(method, url, **kwargs)
+    kwargs = {"headers": headers or {}, "timeout": timeout}
+    if json is not None and method.upper() != "GET":
+        kwargs["json"] = json
+    return requests.request(method, url, **kwargs)
 
 _session_token: Optional[str] = None
 _session_token_expires_at: float = 0.0
@@ -28,17 +53,26 @@ METABASE_SESSION_TTL_SECONDS = int(os.getenv("METABASE_SESSION_TTL_SECONDS", "18
 
 CHART_TYPE_MAPPING: Dict[str, str] = {
     "line": "line",
+    "line_multi": "line",
     "bar": "bar",
+    "bar_grouped": "bar",
+    "bar_stacked": "bar",
+    "pie": "pie",
+    "area": "area",
     "scatter": "scatter",
     "histogram": "histogram",
+    "map": "map",
+    "combo_line_bar": "combo",
+    "combo": "combo",
     "kpi": "scalar",
     "card": "scalar",
     "scalar": "scalar",
     "number": "scalar",
     "grouped_bar": "bar",
+    "stacked_bar": "bar",
     "table": "table",
 }
-SUPPORTED_DISPLAYS = {"line", "bar", "scatter", "scalar", "table", "histogram"}
+SUPPORTED_DISPLAYS = {"line", "bar", "pie", "scatter", "scalar", "table", "histogram", "area", "map", "combo"}
 
 
 def _metabase_base_url() -> str:
@@ -62,7 +96,7 @@ def check_metabase_health(*, retries: int = METABASE_HEALTH_RETRIES) -> bool:
     url = f"{_metabase_base_url()}/api/health"
     for attempt in range(retries + 1):
         try:
-            response = requests.get(url, timeout=METABASE_TIMEOUT_SECONDS)
+            response = _shared_request("GET", url, timeout=METABASE_TIMEOUT_SECONDS)
             if response.status_code == 200:
                 return True
         except Exception as exc:
@@ -98,7 +132,8 @@ def get_metabase_session(force_refresh: bool = False) -> Optional[str]:
 
     for attempt in range(METABASE_AUTH_RETRIES + 1):
         try:
-            response = requests.post(
+            response = _shared_request(
+                "POST",
                 session_url,
                 json=payload,
                 headers={"Content-Type": "application/json"},
@@ -210,54 +245,20 @@ class MetabaseService:
 
     def _prepare_visualization_settings(self, visualization_settings: Optional[Dict[str, Any]]) -> tuple[str, Dict[str, Any]]:
         settings: Dict[str, Any] = dict(visualization_settings or {})
-        requested_display = self._normalize_display(settings.get("display") or settings.get("chart_type"))
-        fallback_applied = False
-        fallback_reason = ""
-        if not requested_display:
-            requested_display = self._safe_display_from_shape(settings)
-            fallback_applied = True
-            fallback_reason = "missing_requested_display"
+        requested_display = self._normalize_display(settings.get("display"))
+        explicit_chart_type = self._normalize_display(
+            settings.get("selected_chart_type") or settings.get("final_chart_type") or settings.get("chart_type")
+        )
+        if not explicit_chart_type:
+            explicit_chart_type = requested_display or self._safe_display_from_shape(settings)
+        display = explicit_chart_type if explicit_chart_type in SUPPORTED_DISPLAYS else "table"
+        fallback_applied = display != explicit_chart_type
+        fallback_reason = f"unsupported_display:{explicit_chart_type}" if fallback_applied else ""
 
-        display = requested_display
-        if display not in SUPPORTED_DISPLAYS:
-            display = self._safe_display_from_shape(settings)
-            fallback_applied = True
-            fallback_reason = f"unsupported_display:{requested_display}"
-
-        if display == "line":
-            dimensions = self._string_list(settings.get("graph.dimensions")) or self._string_list(settings.get("time_columns"))
-            metrics = self._string_list(settings.get("graph.metrics")) or self._string_list(settings.get("numeric_columns"))
-            if dimensions and metrics:
-                settings["graph.dimensions"] = [dimensions[0]]
-                settings["graph.metrics"] = [metrics[0]]
-            else:
-                fallback_applied = True
-                fallback_reason = "invalid_line_shape"
-                display = self._safe_display_from_shape(settings)
-        elif display == "scatter":
-            dimensions = self._string_list(settings.get("graph.dimensions"))
-            metrics = self._string_list(settings.get("graph.metrics"))
-            numeric_columns = self._string_list(settings.get("numeric_columns"))
-            x_axis = dimensions[0] if dimensions else (numeric_columns[0] if len(numeric_columns) >= 1 else "")
-            y_axis = metrics[0] if metrics else (numeric_columns[1] if len(numeric_columns) >= 2 else "")
-            if x_axis and y_axis and x_axis != y_axis:
-                settings["graph.dimensions"] = [x_axis]
-                settings["graph.metrics"] = [y_axis]
-            else:
-                fallback_applied = True
-                fallback_reason = "invalid_scatter_shape"
-                display = self._safe_display_from_shape(settings)
-        elif display == "bar":
-            dimensions = self._string_list(settings.get("graph.dimensions")) or self._string_list(settings.get("category_columns"))
-            metrics = self._string_list(settings.get("graph.metrics")) or self._string_list(settings.get("numeric_columns"))
-            if dimensions:
-                settings["graph.dimensions"] = [dimensions[0]]
-            if metrics:
-                settings["graph.metrics"] = [metrics[0]]
-        elif display in {"histogram", "scalar"}:
-            metrics = self._string_list(settings.get("graph.metrics")) or self._string_list(settings.get("numeric_columns"))
-            if metrics:
-                settings["graph.metrics"] = [metrics[0]]
+        settings["selected_chart_type"] = explicit_chart_type
+        settings["chart_type"] = explicit_chart_type
+        settings["explicit_chart_lock"] = bool(settings.get("explicit_chart_lock", True))
+        settings["chart_locked"] = bool(settings.get("chart_locked", settings["explicit_chart_lock"]))
 
         settings["display"] = display
         settings["requested_display"] = requested_display
@@ -295,11 +296,9 @@ class MetabaseService:
             self._set_last_error("metabase_authentication_failed")
             return None
 
+        request_json = json if (json is not None and method.upper() != "GET") else None
         try:
-            kwargs: Dict[str, Any] = {"headers": headers, "timeout": METABASE_TIMEOUT_SECONDS}
-            if json is not None and method.upper() != "GET":
-                kwargs["json"] = json
-            response = requests.request(method, url, **kwargs)
+            response = _shared_request(method, url, headers=headers, json=request_json, timeout=METABASE_TIMEOUT_SECONDS)
         except Exception as exc:
             self._set_last_error(f"metabase_request_error: {exc}")
             logger.error("Metabase request error %s %s: %s", method, path, exc)
@@ -309,9 +308,8 @@ class MetabaseService:
             clear_metabase_session()
             if get_metabase_session(force_refresh=True):
                 headers = self._headers()
-                kwargs["headers"] = headers
                 try:
-                    response = requests.request(method, url, **kwargs)
+                    response = _shared_request(method, url, headers=headers, json=request_json, timeout=METABASE_TIMEOUT_SECONDS)
                 except Exception as exc:
                     self._set_last_error(f"metabase_request_error_after_refresh: {exc}")
                     logger.error("Metabase retry request error %s %s: %s", method, path, exc)
@@ -320,6 +318,13 @@ class MetabaseService:
                 self._set_last_error("metabase_authentication_failed")
                 return None
 
+        if response.status_code in {502, 503, 504}:
+            time.sleep(1)
+            try:
+                response = _shared_request(method, url, headers=headers, json=request_json, timeout=METABASE_TIMEOUT_SECONDS)
+            except Exception as exc:
+                self._set_last_error(f"metabase_request_error_retry: {exc}")
+                return None
         return response
 
     def authenticate(self, username: Optional[str] = None, password: Optional[str] = None) -> bool:
@@ -339,13 +344,22 @@ class MetabaseService:
         visualization_settings: Optional[Dict] = None,
     ) -> Optional[int]:
         self._set_last_error(None)
+        if not str(name or "").strip() or not str(sql or "").strip():
+            self._set_last_error("invalid_payload:name_and_sql_required")
+            return None
         display, visualization_settings = self._prepare_visualization_settings(visualization_settings)
+
+        sanitized_sql = sanitize_sql_for_metabase(sql)
+        if str(sql or "").strip().endswith(";"):
+            logger.warning("Trailing semicolon detected and removed for Metabase compatibility")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Metabase SQL sanitization original_sql=%r sanitized_sql=%r", sql, sanitized_sql)
 
         payload: Dict[str, Any] = {
             "name": name,
             "dataset_query": {
                 "type": "native",
-                "native": {"query": sql},
+                "native": {"query": sanitized_sql},
                 "database": self.database_id,
             },
             "display": display,
@@ -360,7 +374,7 @@ class MetabaseService:
             name,
             self.database_id,
             payload.get("display"),
-            len(sql or "")
+            len(sanitized_sql or "")
         )
         response = self._request("POST", "/api/card", json=payload)
         if response and response.status_code in (200, 201):
@@ -393,11 +407,17 @@ class MetabaseService:
         self._set_last_error(None)
         display, visualization_settings = self._prepare_visualization_settings(visualization_settings)
 
+        sanitized_sql = sanitize_sql_for_metabase(sql)
+        if str(sql or "").strip().endswith(";"):
+            logger.warning("Trailing semicolon detected and removed for Metabase compatibility")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Metabase SQL sanitization original_sql=%r sanitized_sql=%r", sql, sanitized_sql)
+
         payload: Dict[str, Any] = {
             "name": name,
             "dataset_query": {
                 "type": "native",
-                "native": {"query": sql},
+                "native": {"query": sanitized_sql},
                 "database": self.database_id,
             },
             "display": display,

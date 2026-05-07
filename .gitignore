@@ -28,6 +28,10 @@ env/
 ENV/
 env.bak/
 venv.bak/
+**/venv/
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
 
 # Django
 *.log
@@ -62,6 +66,11 @@ coverage.xml
 *.cover
 .hypothesis/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
+*.pyo
+*.pyd
 
 # Migrations (uncomment if you want to ignore migrations)
 # */migrations/*

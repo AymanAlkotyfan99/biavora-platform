@@ -1,6 +1,7 @@
 from django.urls import path
 from .views import (
-    WorkspaceUpdateView, 
+    WorkspaceUpdateView,
+    WorkspaceDetailByIdView,
     WorkspaceMembersView,
     InvitationView,
     RoleAssignmentView,
@@ -8,12 +9,13 @@ from .views import (
     MemberSuspendView,
     MemberUnsuspendView,
     RemovePendingInvitationView,
-    AcceptInvitationView
+    AcceptInvitationView,
 )
 
 app_name = 'workspace'
 
 urlpatterns = [
+    path('<int:workspace_id>/', WorkspaceDetailByIdView.as_view(), name='workspace-detail-by-id'),
     path('', WorkspaceUpdateView.as_view(), name='workspace-update'),
     path('members/', WorkspaceMembersView.as_view(), name='workspace-members'),
     path('invite/', InvitationView.as_view(), name='workspace-invite'),

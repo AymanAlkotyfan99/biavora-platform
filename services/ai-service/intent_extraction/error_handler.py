@@ -46,6 +46,8 @@ def classify_intent_extraction_error(exception: BaseException) -> IntentExtracti
         return "system"
 
     lowered = str(exception).lower()
+    if "query_service_unauthorized" in lowered or "query_service_auth_not_configured" in lowered:
+        return "query_service_auth"
     if "timeout" in lowered or "timed out" in lowered or "temporary" in lowered:
         return "system"
     if "json" in lowered or "parse" in lowered or "malformed" in lowered:
@@ -68,7 +70,7 @@ def decide_intent_extraction_action(
     retry_count: int,
     config: IntentExtractionConfig,
 ) -> IntentExtractionActionType:
-    if error_type in {"input", "schema_mismatch"}:
+    if error_type in {"input", "schema_mismatch", "query_service_auth"}:
         return "stop"
 
     if error_type in {"system", "model", "unknown"} and retry_count < config.max_retries:

@@ -10,8 +10,21 @@ load_dotenv(BASE_DIR.parent.parent / '.env')
 load_dotenv(BASE_DIR.parent.parent / '.env.microservices')
 
 SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'workspace-service-secret-key')
-DEBUG = os.getenv('DEBUG', 'True') == 'True'
-ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', '*').split(',')
+
+# Phase 11 / CRIT-15: DEBUG defaults to False — production must explicitly
+# set ``DEBUG=True`` to enable stack traces. ``ALLOWED_HOSTS`` is parsed
+# from the env; a missing value yields the safe local default rather than
+# the wildcard ``*`` that previously leaked services to the public internet
+# when run behind a permissive ingress.
+DEBUG = str(os.getenv('DEBUG', 'False')).strip().lower() in {"1", "true", "yes", "on"}
+
+_raw_allowed_hosts = os.getenv('ALLOWED_HOSTS', '').strip()
+if _raw_allowed_hosts:
+    ALLOWED_HOSTS = [host.strip() for host in _raw_allowed_hosts.split(',') if host.strip()]
+elif DEBUG:
+    ALLOWED_HOSTS = ['localhost', '127.0.0.1']
+else:
+    ALLOWED_HOSTS = []
 
 INSTALLED_APPS = [
     'django.contrib.admin',

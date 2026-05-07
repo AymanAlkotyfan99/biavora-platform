@@ -16,7 +16,15 @@ if "dagster" not in sys.modules:
 
     class _AssetExecutionContext:
         def __init__(self):
-            self.log = type("L", (), {"info": lambda *a, **k: None, "warning": lambda *a, **k: None, "error": lambda *a, **k: None})()
+            self.log = type(
+                "L",
+                (),
+                {
+                    "info": lambda *a, **k: None,
+                    "warning": lambda *a, **k: None,
+                    "error": lambda *a, **k: None,
+                },
+            )()
 
     def _asset(*args, **kwargs):
         def decorator(fn):
@@ -52,9 +60,9 @@ assert _execution_spec and _execution_spec.loader
 _execution_module = importlib.util.module_from_spec(_execution_spec)
 _execution_spec.loader.exec_module(_execution_module)
 
-pipeline_result_asset = _execution_module.pipeline_result_asset
 query_execution_asset = _execution_module.query_execution_asset
-_run_downstream_stage = _execution_module._run_downstream_stage
+visualization_asset = _execution_module.visualization_asset
+forecasting_asset = _execution_module.forecasting_asset
 
 
 class _FakeLogger:
@@ -74,475 +82,186 @@ class _FakeContext:
 
 
 class PipelineIntegrationTests(unittest.TestCase):
-    def test_pipeline_result_does_not_double_reject_when_preprocess_high_is_success(self):
-        payload = pipeline_result_asset(
-            pipeline_request_asset={"request_id": "r1", "text": "show cities in north region"},
-            transcription_asset={"status": "success", "text": "show cities in north region"},
-            preprocessing_low_asset={"status": "success", "cleaned_text": "show cities in north region"},
-            intent_classification_asset={
-                "status": "success",
-                "classification": "analytical",
-                "classification_reason": "rule_based_analytical_detection",
-                "confidence": 0.92,
-                "question_type": "analytical",
-            },
-            preprocessing_high_asset={
-                "status": "success",
-                "schema_valid": True,
-                "schema_validation_status": "invalid_unresolved_terms",
-                "final_query": "show cities in north region",
-                "unresolved_terms": ["dummy"],
-                "routing": {"status": "routed"},
-            },
-            intent_extraction_asset={
-                "status": "success",
-                "intent_type": "analytical",
-                "next_step": "metabase",
-                "query": "show cities in north region",
-                "schema": {"population_distribution_csv": [{"name": "city", "type": "String"}]},
-                "extracted_intent": {},
-                "validated_intent": {
-                    "intent": "filtering",
-                    "operations": ["projection", "filtering"],
-                    "table": "population_distribution_csv",
-                    "metrics": [{"column": "city", "aggregation": None, "alias": "city"}],
-                    "dimensions": ["city"],
-                    "filters": [{"column": "region", "operator": "=", "value": "north"}],
-                    "aggregation": None,
-                    "ranking": {"direction": None, "requested": False, "source": "validation"},
-                    "order_by": [],
-                    "limit": None,
-                    "ambiguities": [],
-                },
-            },
-            routing_asset={
-                "status": "routed",
-                "next_step": "metabase",
-                "intent_type": "analytical",
-                "query": "show cities in north region",
-                "schema": {"population_distribution_csv": [{"name": "city", "type": "String"}]},
-            },
-            query_execution_asset={
-                "status": "success",
-                "next_step": "metabase",
-                "intent_type": "analytical",
-                "sql_query": "SELECT city FROM etl.population_distribution_csv;",
-                "generated_sql": "SELECT city FROM etl.population_distribution_csv;",
-                "reviewed_sql": "SELECT city FROM etl.population_distribution_csv;",
-                "sql_review": {"notes": ["ok"], "reason_category": "alignment"},
-                "sql_review_outcome": "approved",
-                "sql_validation_outcome": "passed",
-                "safety_validation_outcome": "passed",
-                "execution_result": {"rows": [{"city": "north_city"}], "row_count": 1, "columns": ["city"]},
-                "result_preview": {"row_count": 1},
-                "referenced_tables": ["population_distribution_csv"],
-                "referenced_columns": ["city", "region"],
-            },
-            visualization_asset={
-                "status": "success",
-                "visualization_status": "success",
-                "selected_chart_type": "bar",
-                "reason_chart_selected": "categorical comparison",
-                "reason_chart_not_generated": "",
-                "visualization_payload_preview": {"chart_type": "bar"},
-                "downstream_result": {"chart_type": "bar"},
-            },
-            forecasting_asset={"status": "skipped", "next_step": "forecasting"},
-        )
-        self.assertEqual(payload.get("status"), "success")
-
-    @patch.object(_execution_module, "execute_clickhouse_query")
     @patch.object(_execution_module, "review_and_correct_sql")
     @patch.object(_execution_module, "build_sql_from_intent")
-    def test_query_execution_falls_back_to_compiler_sql_when_review_rejects(
+    def test_query_execution_asset_returns_sql_ready_without_clickhouse_execution(
         self,
         mock_build_sql,
         mock_review,
-        mock_execute,
     ):
         normalized_intent = {
-            "intent": "ranking",
-            "operations": ["projection", "aggregation", "grouping", "ranking", "limiting"],
-            "table": "population_distribution_csv",
-            "metrics": [{"column": "total_population", "aggregation": "SUM", "alias": "sum_total_population"}],
-            "dimensions": ["city"],
+            "intent": "time_series",
+            "operations": ["projection", "aggregation", "grouping", "time_grouping"],
+            "intent_type": "analytical",
+            "table": "etl.sales",
+            "metrics": [{"column": "total_sales", "aggregation": "SUM", "alias": "total_sales"}],
+            "dimensions": ["ds"],
             "filters": [],
             "aggregation": "SUM",
-            "ranking": {"direction": "DESC", "requested": True, "source": "query"},
-            "order_by": [{"column": "sum_total_population", "direction": "DESC"}],
-            "limit": 5,
+            "ranking": {"direction": None, "requested": False, "source": "validation"},
+            "order_by": [{"column": "ds", "direction": "ASC"}],
+            "limit": 30,
             "ambiguities": [],
         }
         sql = (
-            "SELECT city, SUM(total_population) AS sum_total_population "
-            "FROM etl.population_distribution_csv GROUP BY city ORDER BY sum_total_population DESC LIMIT 5;"
+            "SELECT toDate(ds) AS ds, SUM(total_sales) AS total_sales "
+            "FROM etl.sales GROUP BY ds ORDER BY ds ASC LIMIT 30"
         )
         mock_build_sql.return_value = (normalized_intent, sql)
         mock_review.return_value = {
-            "status": "rejected",
-            "reviewed_sql": "SELECT 1;",
-            "notes": ["bad review"],
+            "status": "approved",
+            "reviewed_sql": sql,
+            "notes": ["approved"],
             "reason_category": "alignment",
         }
-        mock_execute.return_value = {
-            "rows": [{"city": "x", "sum_total_population": 1}],
-            "row_count": 1,
-            "columns": ["city", "sum_total_population"],
-        }
 
-        result = query_execution_asset(
-            context=_FakeContext(),
-            routing_asset={
-                "status": "routed",
-                "next_step": "metabase",
-                "intent_type": "analytical",
-                "query": "show top 5 cities by population",
-                "schema": {
-                    "population_distribution_csv": [
-                        {"name": "city", "type": "String"},
-                        {"name": "total_population", "type": "Float64"},
-                    ]
+        with patch("shared.query_service_auth.require_query_service_bearer_token", return_value="Bearer " + ("x" * 40)):
+            result = query_execution_asset(
+                context=_FakeContext(),
+                routing_asset={
+                    "status": "success",
+                    "next_step": "metabase",
+                    "intent_type": "analytical",
+                    "query": "show total sales by day",
+                    "schema": {
+                        "etl.sales": [
+                            {"name": "ds", "type": "Date"},
+                            {"name": "total_sales", "type": "Float64"},
+                        ]
+                    },
+                    "validated_intent": normalized_intent,
+                    "extracted_intent": {},
+                    "debug_metadata": {
+                        "bound_table": "sales",
+                        "dataset_scope": {"table_name": "sales"},
+                    },
                 },
-                "debug_metadata": {"bound_table": "population_distribution_csv", "dataset_scope": {"table_name": "population_distribution_csv"}},
-                "validated_intent": normalized_intent,
-                "extracted_intent": {},
-            },
-        )
+            )
 
         self.assertEqual(result.get("status"), "success")
-        self.assertEqual(result.get("sql_query"), sql)
-        self.assertEqual(result.get("generated_sql"), sql)
-        self.assertEqual(result.get("reviewed_sql"), sql)
-        self.assertEqual(result.get("sql_review_outcome"), "fallback_compiler")
+        self.assertEqual(result.get("asset_role"), "sql_ready_asset")
+        self.assertEqual(result.get("next_step"), "metabase")
+        self.assertIsNone(result.get("execution_result"))
+        self.assertEqual((result.get("sql_lifecycle") or {}).get("executed"), "skipped")
 
-    @patch.object(_execution_module, "execute_clickhouse_query")
+    def test_query_execution_asset_rejects_when_upstream_rejected(self):
+        result = query_execution_asset(
+            context=_FakeContext(),
+            routing_asset={"status": "rejected", "message": "Non-data question"},
+        )
+        self.assertEqual(result.get("status"), "skipped")
+        self.assertEqual(result.get("next_step"), "stop")
+        self.assertEqual(result.get("sql_query"), "")
+        self.assertEqual(result.get("execution_result"), None)
+
+    def test_visualization_asset_finalizes_chart_contract(self):
+        result = visualization_asset(
+            context=_FakeContext(),
+            query_execution_asset={
+                "status": "success",
+                "next_step": "metabase",
+                "query": "show sales over time",
+                "normalized_intent": {
+                    "intent_type": "analytical",
+                    "metrics": [{"column": "total_sales", "aggregation": "SUM", "alias": "total_sales"}],
+                    "dimensions": ["ds"],
+                },
+                "chart_contract": {
+                    "chart_type": "line",
+                    "selected_chart_type": "line",
+                    "explicit_chart_lock": True,
+                    "chart_reason": "time_series_single_metric",
+                    "chart_confidence": 0.88,
+                },
+            },
+        )
+        self.assertEqual(result.get("status"), "success")
+        self.assertEqual(result.get("next_step"), "metabase")
+        self.assertEqual(result.get("visualization_status"), "finalized")
+        self.assertEqual(result.get("reason_chart_not_generated"), "")
+        self.assertEqual(result.get("selected_chart_type"), "line")
+        self.assertTrue(isinstance(result.get("chart_contract"), dict))
+        self.assertTrue(bool((result.get("chart_contract") or {}).get("visualization_settings")))
+
     @patch.object(_execution_module, "review_and_correct_sql")
     @patch.object(_execution_module, "build_sql_from_intent")
-    def test_query_execution_restores_group_by_for_ranking_when_reviewed_sql_is_unsafe(
+    def test_distribution_query_generates_histogram_contract(
         self,
         mock_build_sql,
         mock_review,
-        mock_execute,
     ):
         normalized_intent = {
-            "intent": "ranking",
-            "operations": ["projection", "aggregation", "grouping", "ranking", "limiting"],
-            "table": "population_distribution_csv",
-            "metrics": [{"column": "total_population", "aggregation": "SUM", "alias": "sum_total_population"}],
-            "dimensions": ["city"],
+            "intent": "distribution",
+            "operations": ["projection", "distribution"],
+            "intent_type": "analytical",
+            "table": "etl.sales_3months_realistic_csv",
+            "metrics": [{"column": "total_sales", "aggregation": None, "alias": "total_sales"}],
+            "dimensions": [],
             "filters": [],
-            "aggregation": "SUM",
-            "ranking": {"direction": "DESC", "requested": True, "source": "query"},
-            "order_by": [{"column": "sum_total_population", "direction": "DESC"}],
-            "limit": 5,
+            "aggregation": None,
+            "ranking": {"direction": None, "requested": False, "source": "validation"},
+            "order_by": [],
+            "limit": None,
             "ambiguities": [],
+            "is_distribution": True,
+            "is_time_series": False,
+            "is_percentage": False,
+            "selected_chart_type": "histogram",
+            "chart_type": "histogram",
         }
-        compiler_sql = (
-            "SELECT city, SUM(total_population) AS sum_total_population "
-            "FROM etl.population_distribution_csv GROUP BY city ORDER BY sum_total_population DESC LIMIT 5;"
+        sql = (
+            "WITH stats AS (SELECT min(total_sales) AS min_value, max(total_sales) AS max_value, count(*) AS row_count "
+            "FROM etl.sales_3months_realistic_csv WHERE total_sales IS NOT NULL) "
+            "SELECT floor(t.total_sales / p.bin_size) * p.bin_size AS bucket, count(*) AS frequency "
+            "FROM etl.sales_3months_realistic_csv AS t CROSS JOIN stats AS p "
+            "WHERE t.total_sales IS NOT NULL GROUP BY bucket ORDER BY bucket"
         )
-        unsafe_reviewed_sql = (
-            "SELECT SUM(total_population) AS sum_total_population "
-            "FROM etl.population_distribution_csv ORDER BY sum_total_population DESC LIMIT 5;"
-        )
-        mock_build_sql.return_value = (normalized_intent, compiler_sql)
+        mock_build_sql.return_value = (normalized_intent, sql)
         mock_review.return_value = {
             "status": "approved",
-            "reviewed_sql": unsafe_reviewed_sql,
-            "notes": ["rewritten"],
+            "reviewed_sql": sql,
+            "notes": ["approved"],
             "reason_category": "alignment",
         }
-        mock_execute.return_value = {
-            "rows": [{"city": "x", "sum_total_population": 1}],
-            "row_count": 1,
-            "columns": ["city", "sum_total_population"],
-        }
-
-        result = query_execution_asset(
-            context=_FakeContext(),
-            routing_asset={
-                "status": "routed",
-                "next_step": "metabase",
-                "intent_type": "analytical",
-                "query": "show top 5 cities by population",
-                "schema": {
-                    "population_distribution_csv": [
-                        {"name": "city", "type": "String"},
-                        {"name": "total_population", "type": "Float64"},
-                    ]
+        with patch("shared.query_service_auth.require_query_service_bearer_token", return_value="Bearer " + ("x" * 40)):
+            result = query_execution_asset(
+                context=_FakeContext(),
+                routing_asset={
+                    "status": "success",
+                    "next_step": "metabase",
+                    "intent_type": "analytical",
+                    "query": "What is the distribution of total sales?",
+                    "schema": {
+                        "etl.sales_3months_realistic_csv": [
+                            {"name": "ds", "type": "Date"},
+                            {"name": "total_sales", "type": "Float64"},
+                        ]
+                    },
+                    "validated_intent": normalized_intent,
+                    "extracted_intent": {},
+                    "debug_metadata": {
+                        "bound_table": "sales_3months_realistic_csv",
+                        "dataset_scope": {"table_name": "sales_3months_realistic_csv"},
+                    },
                 },
-                "debug_metadata": {"bound_table": "population_distribution_csv", "dataset_scope": {"table_name": "population_distribution_csv"}},
-                "validated_intent": normalized_intent,
-                "extracted_intent": {},
-            },
-        )
-
+            )
         self.assertEqual(result.get("status"), "success")
-        self.assertEqual(result.get("sql_query"), compiler_sql)
-        self.assertEqual(result.get("reviewed_sql"), compiler_sql)
-        self.assertEqual(result.get("sql_review_outcome"), "ranking_group_by_guard")
+        self.assertIn("GROUP BY bucket", str(result.get("sql_query", "")))
+        chart_contract = result.get("chart_contract") or {}
+        self.assertEqual(chart_contract.get("chart_type"), "histogram")
 
-    @patch.object(_execution_module, "execute_downstream_route")
-    def test_visualization_forces_bar_for_ranking_with_dimension(self, mock_downstream):
-        mock_downstream.return_value = (
-            "metabase",
-            {
-                "chart_type": "card",
-                "reason": "scalar-summary",
-            },
-        )
-        result = _run_downstream_stage(
+    def test_forecasting_asset_delegates_to_voice_service(self):
+        result = forecasting_asset(
             context=_FakeContext(),
-            query_execution_result={
-                "status": "success",
-                "next_step": "metabase",
-                "sql_query": "SELECT city, SUM(total_population) AS sum_total_population FROM etl.population_distribution_csv GROUP BY city ORDER BY sum_total_population DESC LIMIT 5;",
-                "execution_result": {
-                    "rows": [{"city": "a", "sum_total_population": 10}],
-                    "row_count": 1,
-                    "columns": ["city", "sum_total_population"],
-                },
-                "validated_intent": {
-                    "intent": "ranking",
-                    "ranking": {"direction": "DESC"},
-                    "dimensions": ["city"],
-                },
-                "normalized_intent": {
-                    "intent": "ranking",
-                    "ranking": {"direction": "DESC"},
-                    "dimensions": ["city"],
-                },
-            },
-            expected_next_step="metabase",
-        )
-        self.assertEqual(result.get("status"), "success")
-        self.assertEqual(result.get("selected_chart_type"), "bar")
-        self.assertEqual(result.get("reason_chart_selected"), "adjusted_from_card:priority_category_comparison_bar")
-
-    @patch.object(_execution_module, "execute_downstream_route")
-    def test_visualization_forces_line_for_time_grouping(self, mock_downstream):
-        mock_downstream.return_value = (
-            "metabase",
-            {
-                "chart_type": "card",
-                "reason": "scalar-summary",
-            },
-        )
-        result = _run_downstream_stage(
-            context=_FakeContext(),
-            query_execution_result={
-                "status": "success",
-                "next_step": "metabase",
-                "sql_query": "SELECT toStartOfWeek(ds) AS period, SUM(total_population) AS sum_total_population FROM etl.population_distribution_csv GROUP BY period ORDER BY period ASC;",
-                "execution_result": {
-                    "rows": [{"period": "2026-01-05", "sum_total_population": 10}],
-                    "row_count": 1,
-                    "columns": ["period", "sum_total_population"],
-                },
-                "validated_intent": {
-                    "intent": "aggregation",
-                    "time_granularity": "week",
-                    "time_grouping_detected": True,
-                    "dimensions": ["ds"],
-                },
-                "normalized_intent": {
-                    "intent": "aggregation",
-                    "time_granularity": "week",
-                    "time_grouping_detected": True,
-                    "dimensions": ["ds"],
-                },
-            },
-            expected_next_step="metabase",
-        )
-        self.assertEqual(result.get("status"), "success")
-        self.assertEqual(result.get("selected_chart_type"), "line")
-        self.assertEqual(result.get("reason_chart_selected"), "adjusted_from_card:priority_time_series_line")
-
-    @patch.object(_execution_module, "execute_downstream_route")
-    def test_visualization_forces_card_for_single_value(self, mock_downstream):
-        mock_downstream.return_value = (
-            "metabase",
-            {
-                "chart_type": "table",
-                "reason": "default",
-            },
-        )
-        result = _run_downstream_stage(
-            context=_FakeContext(),
-            query_execution_result={
-                "status": "success",
-                "next_step": "metabase",
-                "sql_query": "SELECT SUM(total_population) AS sum_total_population FROM etl.population_distribution_csv;",
-                "execution_result": {
-                    "rows": [{"sum_total_population": 10}],
-                    "row_count": 1,
-                    "columns": ["sum_total_population"],
-                },
-                "validated_intent": {
-                    "intent": "aggregation",
-                    "dimensions": [],
-                },
-                "normalized_intent": {
-                    "intent": "aggregation",
-                    "dimensions": [],
-                },
-            },
-            expected_next_step="metabase",
-        )
-        self.assertEqual(result.get("status"), "success")
-        self.assertEqual(result.get("selected_chart_type"), "card")
-        self.assertEqual(result.get("reason_chart_selected"), "priority_single_value_card")
-
-    @patch.object(_execution_module, "execute_downstream_route")
-    def test_visualization_time_series_shape_defaults_line_with_column_metadata(self, mock_downstream):
-        mock_downstream.return_value = ("metabase", {"status": "pending_integration"})
-        result = _run_downstream_stage(
-            context=_FakeContext(),
-            query_execution_result={
-                "status": "success",
-                "next_step": "metabase",
-                "query": "average order value per day",
-                "sql_query": "SELECT toDate(ds) AS period, SUM(total_sales) / NULLIF(SUM(orders), 0) AS average_order_value FROM etl.sales GROUP BY period ORDER BY period ASC;",
-                "execution_result": {
-                    "rows": [
-                        {"period": "2026-01-01", "average_order_value": 12.1},
-                        {"period": "2026-01-02", "average_order_value": 14.0},
-                    ],
-                    "row_count": 2,
-                    "columns": [
-                        {"name": "period", "type": "Date"},
-                        {"name": "average_order_value", "type": "Float64"},
-                    ],
-                },
-                "validated_intent": {
-                    "intent": "time_series",
-                    "operations": ["projection", "aggregation", "grouping", "time_grouping"],
-                    "time_grouping_detected": True,
-                    "time_granularity": "day",
-                },
-                "normalized_intent": {
-                    "intent": "time_series",
-                    "operations": ["projection", "aggregation", "grouping", "time_grouping"],
-                    "time_grouping_detected": True,
-                    "time_granularity": "day",
-                },
-            },
-            expected_next_step="metabase",
-        )
-        self.assertEqual(result.get("status"), "success")
-        self.assertEqual(result.get("selected_chart_type"), "line")
-
-    @patch.object(_execution_module, "execute_downstream_route")
-    def test_visualization_relationship_shape_defaults_scatter_with_column_metadata(self, mock_downstream):
-        mock_downstream.return_value = ("metabase", {"status": "pending_integration"})
-        result = _run_downstream_stage(
-            context=_FakeContext(),
-            query_execution_result={
-                "status": "success",
-                "next_step": "metabase",
-                "query": "relationship between customers and total sales",
-                "sql_query": "SELECT customers, total_sales FROM etl.sales;",
-                "execution_result": {
-                    "rows": [
-                        {"customers": 10, "total_sales": 120.0},
-                        {"customers": 30, "total_sales": 350.0},
-                    ],
-                    "row_count": 2,
-                    "columns": [
-                        {"name": "customers", "type": "UInt32"},
-                        {"name": "total_sales", "type": "Float64"},
-                    ],
-                },
-                "validated_intent": {
-                    "intent": "correlation",
-                    "operations": ["projection", "comparison", "relationship"],
-                },
-                "normalized_intent": {
-                    "intent": "correlation",
-                    "operations": ["projection", "comparison", "relationship"],
-                },
-            },
-            expected_next_step="metabase",
-        )
-        self.assertEqual(result.get("status"), "success")
-        self.assertEqual(result.get("selected_chart_type"), "scatter")
-
-    @patch.object(_execution_module, "execute_downstream_route")
-    def test_visualization_forces_scatter_for_relationship_comparison(self, mock_downstream):
-        mock_downstream.return_value = (
-            "metabase",
-            {
-                "chart_type": "table",
-                "reason": "default",
-            },
-        )
-        result = _run_downstream_stage(
-            context=_FakeContext(),
-            query_execution_result={
-                "status": "success",
-                "next_step": "metabase",
-                "sql_query": "SELECT revenue, profit FROM etl.sales_fact;",
-                "execution_result": {
-                    "rows": [{"revenue": 10, "profit": 1}, {"revenue": 20, "profit": 2}],
-                    "row_count": 2,
-                    "columns": ["revenue", "profit"],
-                },
-                "validated_intent": {
-                    "intent": "comparison",
-                    "operations": ["projection", "comparison"],
-                    "dimensions": [],
-                    "metrics": [
-                        {"column": "revenue", "aggregation": None, "alias": None},
-                        {"column": "profit", "aggregation": None, "alias": None},
-                    ],
-                },
-                "normalized_intent": {
-                    "intent": "comparison",
-                    "operations": ["projection", "comparison"],
-                    "dimensions": [],
-                    "metrics": [
-                        {"column": "revenue", "aggregation": None, "alias": None},
-                        {"column": "profit", "aggregation": None, "alias": None},
-                    ],
-                },
-            },
-            expected_next_step="metabase",
-        )
-        self.assertEqual(result.get("status"), "success")
-        self.assertEqual(result.get("selected_chart_type"), "scatter")
-        self.assertEqual(result.get("reason_chart_selected"), "priority_correlation_scatter")
-
-    @patch.object(_execution_module, "execute_downstream_route")
-    def test_forecasting_downstream_exception_surfaces_degraded_status(self, mock_downstream):
-        mock_downstream.side_effect = RuntimeError("forecast backend unavailable")
-        result = _run_downstream_stage(
-            context=_FakeContext(),
-            query_execution_result={
+            query_execution_asset={
                 "status": "success",
                 "next_step": "forecasting",
-                "sql_query": "SELECT ds, value FROM etl.sales ORDER BY ds ASC;",
-                "execution_result": {
-                    "rows": [{"ds": "2026-01-01", "value": 10.0}],
-                    "row_count": 1,
-                    "columns": ["ds", "value"],
-                },
-                "validated_intent": {
-                    "intent_type": "predictive",
-                    "question_type": "predictive",
-                    "requires_forecast": True,
-                },
-                "normalized_intent": {
-                    "intent_type": "predictive",
-                    "question_type": "predictive",
-                    "requires_forecast": True,
-                },
             },
-            expected_next_step="forecasting",
         )
-        self.assertEqual(result.get("status"), "degraded")
-        self.assertTrue(result.get("degraded"))
-        self.assertEqual(result.get("visualization_status"), "degraded")
-        self.assertEqual(result.get("selected_chart_type"), "line")
+        self.assertEqual(result.get("status"), "delegated")
+        self.assertEqual(result.get("next_step"), "forecasting")
+        self.assertEqual(result.get("error_type"), "forecasting_delegated_to_voice_service")
+        self.assertEqual(result.get("downstream_result"), None)
 
 
 if __name__ == "__main__":

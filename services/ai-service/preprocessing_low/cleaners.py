@@ -20,6 +20,18 @@ _FILLER_PATTERN = re.compile(
     r"\b(?:like|you know|i mean|sort of|kind of|basically|actually|please)\b",
     flags=re.IGNORECASE,
 )
+_GREETING_LEADING_PATTERN = re.compile(
+    r"^\s*(?:hi|hello|hey)\b[\s,!?-]*",
+    flags=re.IGNORECASE,
+)
+_POLITE_LEADING_PATTERN = re.compile(
+    r"^\s*(?:can you|could you|show me)\b[\s,!?-]*",
+    flags=re.IGNORECASE,
+)
+_POLITE_TRAILING_PATTERN = re.compile(
+    r"[\s,!?-]*(?:please)\s*$",
+    flags=re.IGNORECASE,
+)
 _DUPLICATE_WORD_PATTERN = re.compile(r"\b(\w+)(?:\s+\1\b)+", flags=re.IGNORECASE)
 _EXCESSIVE_PUNCTUATION_PATTERN = re.compile(r"([!?.,;:])\1+")
 _CONTROL_CHARS_PATTERN = re.compile(r"[\x00-\x1F\x7F]")
@@ -104,6 +116,7 @@ _SPELLING_LEXICON = {
     "avg",
     "count",
     "number",
+    "total",
     "top",
     "bottom",
     "highest",
@@ -122,6 +135,10 @@ _SPELLING_LEXICON = {
     "profit",
     "margin",
     "sales",
+    "customer",
+    "customers",
+    "order",
+    "orders",
     "trend",
     "distribution",
     "breakdown",
@@ -316,7 +333,7 @@ def _conservative_spelling_correction(text: str) -> tuple[str, list[dict[str, st
         if len(token_lower) < 4:
             return token
 
-        matches = get_close_matches(token_lower, list(_SPELLING_LEXICON), n=1, cutoff=0.88)
+        matches = get_close_matches(token_lower, list(_SPELLING_LEXICON), n=1, cutoff=0.8)
         if not matches:
             return token
 
@@ -364,6 +381,19 @@ def _rule_based_clean_with_changes(text: str) -> tuple[str, list[dict[str, str]]
     if cleaned != source_text:
         _append_change(changes, change_type="normalized_control_chars", before=source_text, after=cleaned)
 
+    for pattern in (_GREETING_LEADING_PATTERN, _POLITE_LEADING_PATTERN):
+        match = pattern.search(cleaned)
+        if match:
+            removed = match.group(0).strip()
+            if removed:
+                _append_change(
+                    changes,
+                    change_type="removed_filler_words",
+                    before=removed,
+                    after="",
+                )
+            cleaned = pattern.sub("", cleaned, count=1)
+
     for pattern, change_type in (
         (_CONTROL_CHARS_PATTERN, "removed_control_chars"),
         (_MALFORMED_SYMBOL_PATTERN, "removed_malformed_symbols"),
@@ -381,6 +411,18 @@ def _rule_based_clean_with_changes(text: str) -> tuple[str, list[dict[str, str]]
                 after="",
             )
             cleaned = pattern.sub(" ", cleaned)
+
+    trailing_polite_match = _POLITE_TRAILING_PATTERN.search(cleaned)
+    if trailing_polite_match:
+        removed = trailing_polite_match.group(0).strip()
+        if removed:
+            _append_change(
+                changes,
+                change_type="removed_filler_words",
+                before=removed,
+                after="",
+            )
+        cleaned = _POLITE_TRAILING_PATTERN.sub("", cleaned, count=1)
 
     repeated_chars_cleaned = _reduce_repeated_characters(cleaned, max_repeats=2)
     if repeated_chars_cleaned != cleaned:
@@ -433,11 +475,6 @@ def _rule_based_clean_with_changes(text: str) -> tuple[str, list[dict[str, str]]
         )
         cleaned = casing_cleaned
 
-    spelling_cleaned, spelling_changes = _conservative_spelling_correction(cleaned)
-    if spelling_cleaned != cleaned:
-        cleaned = spelling_cleaned
-        changes.extend(spelling_changes)
-
     compact_cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if compact_cleaned != cleaned:
         _append_change(
@@ -447,6 +484,11 @@ def _rule_based_clean_with_changes(text: str) -> tuple[str, list[dict[str, str]]
             after=compact_cleaned,
         )
     cleaned = compact_cleaned
+
+    spelling_cleaned, spelling_changes = _conservative_spelling_correction(cleaned)
+    if spelling_cleaned != cleaned:
+        cleaned = spelling_cleaned
+    changes.extend(spelling_changes)
 
     flags = {
         "punctuation_only_input": bool(_PUNCT_ONLY_PATTERN.fullmatch(source_text.strip())) if source_text.strip() else False,

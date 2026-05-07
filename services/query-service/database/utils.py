@@ -1,8 +1,10 @@
 """
 Utility functions for database operations including ClickHouse cleanup.
 """
-import requests
 import logging
+
+import requests
+from bi_platform_shared.http import HttpClientError, get_default_client
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
@@ -27,7 +29,16 @@ class ClickHouseClient:
             if self.password:
                 params['password'] = self.password
             
-            response = requests.post(self.base_url, params=params, timeout=10)
+            try:
+                response = get_default_client().post(
+                    self.base_url,
+                    params=params,
+                    timeout=(3.0, 10.0),
+                    attach_internal_api_key=False,
+                )
+            except HttpClientError as exc:
+                logger.error("ClickHouse query error: %s", exc)
+                return {'success': False, 'error': str(exc)}
             response.raise_for_status()
             return {'success': True, 'data': response.text}
         except Exception as e:

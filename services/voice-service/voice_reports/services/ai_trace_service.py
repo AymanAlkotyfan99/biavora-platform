@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
 from typing import Any
 
 MAX_TRACE_SAMPLE_ROWS = 10
@@ -17,6 +18,54 @@ def _safe_dict(payload: Any) -> dict[str, Any]:
 
 def _safe_list(payload: Any) -> list[Any]:
     return payload if isinstance(payload, list) else []
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float):
+        parsed_float = int(value)
+        return parsed_float if parsed_float > 0 else None
+
+    normalized = str(value or "").strip()
+    if not normalized:
+        return None
+
+    if not re.fullmatch(r"-?\d+", normalized):
+        match = re.search(r"-?\d+", normalized)
+        if not match:
+            return None
+        normalized = match.group(0)
+
+    try:
+        parsed = int(normalized)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _normalize_trace_stage_aliases(trace: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(trace)
+    alias_map = {
+        "classification": ("classification_asset", "input_validation"),
+        "intent_extraction": ("intent_extraction_asset", "analytical_intent"),
+        "query_execution": ("query_execution_asset",),
+        "visualization": ("visualization_asset",),
+        "preprocessing_low": ("preprocessing_low_asset",),
+        "preprocessing_high": ("preprocessing_high_asset",),
+        "routing": ("routing_asset",),
+        "forecasting": ("forecasting_asset",),
+    }
+    for canonical, aliases in alias_map.items():
+        if canonical in normalized:
+            continue
+        for alias in aliases:
+            if alias in normalized and isinstance(normalized.get(alias), dict):
+                normalized[canonical] = _safe_dict(normalized.get(alias))
+                break
+    return normalized
 
 
 def _normalize_status(value: Any) -> str:
@@ -44,6 +93,26 @@ def _extract_stage(trace: dict[str, Any], stage_name: str) -> tuple[dict[str, An
     stage_payload = _safe_dict(trace.get(stage_name))
     final_output = _safe_dict(stage_payload.get("final_output"))
     return stage_payload, final_output
+
+
+def _extract_stage_any(trace: dict[str, Any], stage_names: list[str]) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    for stage_name in stage_names:
+        if stage_name not in trace:
+            continue
+        stage_payload = _safe_dict(trace.get(stage_name))
+        final_output = _safe_dict(stage_payload.get("final_output"))
+        return stage_payload, final_output, True
+    return {}, {}, False
+
+
+def _status_from_stage(*, stage_payload: dict[str, Any], stage_exists: bool) -> str:
+    if not stage_exists:
+        return "skipped"
+    normalized = _normalize_status(stage_payload.get("status") or "success")
+    if normalized == "degraded":
+        return "degraded"
+    # Dagster asset exists => never surface as skipped in AI trace.
+    return "success"
 
 
 def _normalize_question_type(
@@ -96,9 +165,9 @@ def _extract_forecasting(
     actual_rows = [row for row in rows if isinstance(row, dict) and row.get("series_type") == "actual"]
     forecast_rows = [row for row in rows if isinstance(row, dict) and row.get("series_type") == "forecast"]
 
-    frequency_seconds = meta_payload.get("frequency_seconds")
+    frequency_seconds = _coerce_positive_int(meta_payload.get("frequency_seconds"))
     granularity = ""
-    if isinstance(frequency_seconds, int) and frequency_seconds > 0:
+    if frequency_seconds is not None:
         if frequency_seconds % 86400 == 0:
             days = frequency_seconds // 86400
             granularity = "daily" if days == 1 else f"{days}-day"
@@ -107,6 +176,10 @@ def _extract_forecasting(
             granularity = "hourly" if hours == 1 else f"{hours}-hour"
         else:
             granularity = f"{frequency_seconds}-second"
+
+    horizon = _coerce_positive_int(meta_payload.get("horizon"))
+    if horizon is None:
+        horizon = _coerce_positive_int(request_payload.get("horizon"))
 
     status = str(forecasting_payload.get("status") or "skipped").strip().lower()
     normalized_status = "success" if status == "success" else ("failed" if status == "failed" else "skipped")
@@ -130,7 +203,7 @@ def _extract_forecasting(
         "reason": str(forecasting_payload.get("reason") or ""),
         "detected_time_column": str(meta_payload.get("time_column") or ""),
         "detected_value_column": str(meta_payload.get("value_column") or ""),
-        "horizon": int(meta_payload.get("horizon") or request_payload.get("horizon") or 0) or None,
+        "horizon": horizon,
         "granularity": granularity,
         "validation_notes": validation_notes,
         "model_used": "TimesFM",
@@ -236,6 +309,86 @@ def _extract_preprocessing_corrections(preprocess_high: dict[str, Any]) -> list[
     return normalized
 
 
+def _build_chart_decision_trace(
+    *,
+    chart_type: str,
+    chart_config: dict[str, Any],
+    visualization_stage: dict[str, Any],
+) -> dict[str, Any]:
+    canonical_contract = _safe_dict(chart_config.get("chart_contract"))
+    upstream_chart = str(
+        canonical_contract.get("type")
+        or canonical_contract.get("final_chart_type")
+        or canonical_contract.get("chart_type")
+        or chart_config.get("upstream_chart_type")
+        or chart_config.get("selected_chart_type")
+        or chart_config.get("chart_type")
+        or ""
+    ).strip().lower()
+    final_chart = str(
+        canonical_contract.get("type")
+        or canonical_contract.get("final_chart_type")
+        or chart_type
+        or chart_config.get("chart_type")
+        or "table"
+    ).strip().lower() or "table"
+    chart_locked = bool(chart_config.get("chart_locked"))
+    explicit_chart_lock = bool(chart_config.get("explicit_chart_lock") or chart_locked)
+    overwritten_by = str(chart_config.get("overwritten_by") or "").strip()
+    fallback_reason = str(chart_config.get("fallback_reason") or "").strip()
+    reason = str(chart_config.get("reason_chart_selected") or "").strip() or "chart_selected"
+    overwritten = bool(overwritten_by) or (bool(upstream_chart) and upstream_chart != final_chart)
+
+    decision_chain = []
+    decision_chain.append(
+        {
+            "stage": "ai-service",
+            "chart": upstream_chart or final_chart,
+            "action": "selected",
+            "reason": "user_explicit_request" if explicit_chart_lock else "model_selection",
+        }
+    )
+    if overwritten:
+        decision_chain.append(
+            {
+                "stage": overwritten_by or "report-service",
+                "chart": final_chart,
+                "action": "overridden",
+                "reason": fallback_reason or reason or "shape_fallback",
+            }
+        )
+    else:
+        decision_chain.append(
+            {
+                "stage": "report-service",
+                "chart": final_chart,
+                "action": "preserved",
+                "reason": "explicit_chart_preserved" if explicit_chart_lock else reason,
+            }
+        )
+    decision_chain.append(
+        {
+            "stage": "visualization-service",
+            "chart": final_chart,
+            "action": "sent_to_metabase",
+            "reason": str(_safe_dict(visualization_stage.get("final_output")).get("reason_chart_selected") or "final_validated_chart"),
+        }
+    )
+    return {
+        "upstream_chart": upstream_chart or final_chart,
+        "initial_selected_chart": upstream_chart or final_chart,
+        "final_chart": final_chart,
+        "chart_locked": chart_locked,
+        "explicit_chart_lock": explicit_chart_lock,
+        "overwritten": overwritten,
+        "overwritten_by": overwritten_by if overwritten else "",
+        "reason": reason if overwritten else "explicit_chart_preserved",
+        "fallback_reason": fallback_reason,
+        "downgrade_reason": str(chart_config.get("downgrade_reason") or "").strip(),
+        "decision_chain": decision_chain,
+    }
+
+
 def build_ai_trace_payload(
     *,
     report_id: int | None,
@@ -259,23 +412,35 @@ def build_ai_trace_payload(
     normalized_pre_low = _safe_dict(preprocessing_low)
     normalized_pre_high = _safe_dict(preprocessing_high)
     normalized_intent = _safe_dict(intent_json)
-    normalized_trace = _safe_dict(pipeline_trace)
+    normalized_trace = _normalize_trace_stage_aliases(_safe_dict(pipeline_trace))
     normalized_result = _safe_dict(query_result)
     normalized_chart_config = _safe_dict(chart_config)
 
-    classification_stage, classification_final = _extract_stage(normalized_trace, "classification")
-    if not classification_stage:
-        classification_stage, classification_final = _extract_stage(normalized_trace, "input_validation")
-    intent_stage, intent_final = _extract_stage(normalized_trace, "intent_extraction")
-    if not intent_stage:
-        intent_stage, intent_final = _extract_stage(normalized_trace, "analytical_intent")
-    routing_stage, routing_final = _extract_stage(normalized_trace, "routing")
-    pre_high_stage, pre_high_final = _extract_stage(normalized_trace, "preprocessing_high")
+    classification_stage, classification_final, classification_exists = _extract_stage_any(
+        normalized_trace, ["classification_asset", "classification", "input_validation"]
+    )
+    intent_stage, intent_final, intent_exists = _extract_stage_any(
+        normalized_trace, ["intent_extraction_asset", "intent_extraction", "analytical_intent"]
+    )
+    routing_stage, routing_final, _ = _extract_stage_any(normalized_trace, ["routing_asset", "routing"])
+    pre_low_stage, _, pre_low_exists = _extract_stage_any(normalized_trace, ["preprocessing_low_asset", "preprocessing_low"])
+    pre_high_stage, pre_high_final, pre_high_exists = _extract_stage_any(
+        normalized_trace, ["preprocessing_high_asset", "preprocessing_high"]
+    )
     predictive_stage, predictive_final = _extract_stage(normalized_trace, "predictive_intent")
-    sql_generation_stage, sql_generation_final = _extract_stage(normalized_trace, "sql_generation")
+    sql_generation_stage, sql_generation_final, _ = _extract_stage_any(
+        normalized_trace, ["query_execution_asset", "sql_generation"]
+    )
     sql_review_stage, sql_review_final = _extract_stage(normalized_trace, "sql_review")
-    query_execution_stage, query_execution_final = _extract_stage(normalized_trace, "query_execution")
-    visualization_stage, _ = _extract_stage(normalized_trace, "visualization")
+    query_execution_stage, query_execution_final, query_execution_exists = _extract_stage_any(
+        normalized_trace, ["query_execution_asset", "query_execution"]
+    )
+    visualization_stage, visualization_final, visualization_exists = _extract_stage_any(
+        normalized_trace, ["visualization_asset", "visualization"]
+    )
+    forecasting_stage, _, forecasting_exists = _extract_stage_any(
+        normalized_trace, ["forecasting_asset", "forecasting"]
+    )
 
     question_type = _normalize_question_type(
         normalized_intent,
@@ -292,16 +457,28 @@ def build_ai_trace_payload(
     if requires_forecast:
         question_type = "predictive"
     is_analytical = question_type in {"analytical", "predictive"}
-    preprocessing_high_status = _normalize_status(pre_high_stage.get("status") or "skipped")
+    preprocessing_high_status = _status_from_stage(stage_payload=pre_high_stage, stage_exists=pre_high_exists)
     preprocessing_high_failed = preprocessing_high_status == "error"
 
     extracted_intent = _safe_dict(intent_final.get("extracted_intent")) or normalized_intent
     validated_intent = _safe_dict(intent_final.get("validated_intent"))
+    intent_type_for_trace = str(
+        routing_final.get("intent_type")
+        or intent_final.get("intent_type")
+        or normalized_intent.get("intent_type")
+        or normalized_intent.get("question_type")
+        or ""
+    ).strip().lower()
+    if not intent_type_for_trace:
+        intent_type_for_trace = "predictive" if requires_forecast else "analytical"
+    elif requires_forecast and intent_type_for_trace not in {"predictive", "forecast", "forecasting"}:
+        intent_type_for_trace = "predictive"
 
     columns = [str(column) for column in _safe_list(normalized_result.get("columns")) if str(column).strip()]
     rows = _safe_list(normalized_result.get("rows"))
     sampled_rows = _sample_rows(rows)
     normalized_row_count = int(row_count or len(rows))
+    timeseries_diagnostics = _safe_dict(normalized_chart_config.get("timeseries_diagnostics"))
 
     forecasting_trace = _extract_forecasting(
         chart_config=normalized_chart_config,
@@ -314,12 +491,19 @@ def build_ai_trace_payload(
         sql_review_notes = _safe_list(_safe_dict(sql_review_final.get("sql_review")).get("notes"))
     sql_review_notes = [str(note) for note in sql_review_notes if str(note).strip()]
     preprocessing_corrections = _extract_preprocessing_corrections(normalized_pre_high)
-    classification_status = _normalize_status(classification_stage.get("status") or "unknown")
+    classification_status = _status_from_stage(stage_payload=classification_stage, stage_exists=classification_exists)
+    classifier_called = classification_exists or bool(classification_stage) or bool(classification_final)
     classification_error = classification_status == "error"
     # If high preprocessing completed (including deferred/degraded recovery), avoid surfacing
     # stale classification errors as final failures.
     if preprocessing_high_status in {"success", "degraded"}:
         classification_error = False
+
+    chart_decision_trace = _build_chart_decision_trace(
+        chart_type=chart_type,
+        chart_config=normalized_chart_config,
+        visualization_stage=visualization_stage,
+    )
 
     trace = {
         "report_id": report_id,
@@ -327,13 +511,10 @@ def build_ai_trace_payload(
             "original_question",
             "preprocessing_low",
             "classification",
-            "routing",
             "preprocessing_high",
-            "predictive_intent",
             "intent_extraction",
-            "sql",
+            "sql_generation",
             "execution",
-            "forecasting",
             "visualization",
         ],
         "original_question": {
@@ -341,9 +522,13 @@ def build_ai_trace_payload(
             "status": "success",
         },
         "preprocessing_low": {
-            "status": _normalize_status(_safe_dict(normalized_trace.get("preprocessing_low")).get("status") or "success"),
+            "status": _status_from_stage(stage_payload=pre_low_stage, stage_exists=pre_low_exists),
             "original_text": str(normalized_pre_low.get("original_text") or transcription or ""),
             "cleaned_text": str(normalized_pre_low.get("cleaned_text") or transcription or ""),
+            "spelling_corrected_text": str(normalized_pre_low.get("spelling_corrected_text") or ""),
+            "spelling_changes": _safe_list(normalized_pre_low.get("spelling_changes")),
+            "has_spelling_correction": bool(normalized_pre_low.get("has_spelling_correction")),
+            "removed_filler_words": _safe_list(normalized_pre_low.get("removed_filler_words")),
             "detected_changes": _safe_list(normalized_pre_low.get("changes") or normalized_pre_low.get("detected_changes")),
         },
         "classification": {
@@ -360,11 +545,23 @@ def build_ai_trace_payload(
             ),
             "question_type": question_type,
             "requires_forecast": requires_forecast,
+            "type": str(
+                classification_final.get("type")
+                or classification_final.get("classification_type")
+                or ""
+            ),
             "confidence": classification_final.get("confidence") or normalized_intent.get("confidence") or None,
             "reasoning": str(
-                classification_final.get("reason")
+                classification_final.get("reasoning")
+                or classification_final.get("reason")
                 or classification_final.get("message")
                 or normalized_intent.get("classification_reason")
+                or ""
+            ),
+            "raw_model_response": str(
+                classification_final.get("raw_model_response")
+                or _safe_dict(classification_stage.get("debug_metadata")).get("raw_model_response")
+                or _safe_dict(classification_stage.get("debug_metadata")).get("raw_classifier_output")
                 or ""
             ),
         },
@@ -438,10 +635,13 @@ def build_ai_trace_payload(
             "skipped_reason": "" if question_type == "predictive" else "analytical_route_selected",
         },
         "intent_extraction": {
-            "status": _normalize_status(intent_stage.get("status") or routing_stage.get("status") or "unknown"),
-            "intent_type": str(routing_final.get("intent_type") or intent_final.get("intent_type") or normalized_intent.get("intent_type") or ""),
+            "status": _status_from_stage(stage_payload=intent_stage, stage_exists=intent_exists),
+            "intent_type": intent_type_for_trace,
             "extracted_intent": extracted_intent,
             "validated_intent": validated_intent,
+            "operations": _safe_list(extracted_intent.get("operations") or validated_intent.get("operations")),
+            "columns": _safe_list(extracted_intent.get("columns") or validated_intent.get("columns")),
+            "time_range": _safe_dict(extracted_intent.get("time_range") or validated_intent.get("time_range")),
             "routing_decision": {
                 "next_step": str(routing_final.get("next_step") or ""),
                 "reason": str(routing_final.get("route_reason") or routing_final.get("reason") or ""),
@@ -449,27 +649,77 @@ def build_ai_trace_payload(
             },
             "ambiguities": _safe_list(validated_intent.get("ambiguities")),
         },
-        "sql": {
-            "status": _normalize_status(sql_review_stage.get("status") or sql_generation_stage.get("status") or "unknown"),
+        "sql_generation": {
+            "status": _status_from_stage(
+                stage_payload=(sql_review_stage or sql_generation_stage),
+                stage_exists=query_execution_exists,
+            ),
             "generated_sql": str(generated_sql or sql_generation_final.get("generated_sql") or ""),
             "reviewed_sql": str(reviewed_sql or sql_review_final.get("reviewed_sql") or ""),
+            "sql": str(
+                reviewed_sql
+                or generated_sql
+                or query_execution_final.get("sql")
+                or sql_generation_final.get("sql")
+                or ""
+            ),
+            "row_count": normalized_row_count,
+            "execution_time_ms": int(execution_time_ms or 0) if execution_time_ms is not None else None,
             "sql_review_notes": sql_review_notes,
             "historical_sql_only": bool(_safe_dict(sql_generation_final).get("historical_sql_only")),
         },
         "execution": {
-            "status": _normalize_status(query_execution_stage.get("status") or "unknown"),
+            "status": _status_from_stage(stage_payload=query_execution_stage, stage_exists=query_execution_exists),
             "execution_time_ms": int(execution_time_ms or 0) if execution_time_ms is not None else None,
             "row_count": normalized_row_count,
             "columns": columns,
             "sample_rows": sampled_rows,
+            "timeseries_profile": {
+                "min_ds": str(timeseries_diagnostics.get("min_ds") or ""),
+                "max_ds": str(timeseries_diagnostics.get("max_ds") or ""),
+                "detected_granularity": str(timeseries_diagnostics.get("detected_granularity") or ""),
+                "series_type_counts": _safe_dict(timeseries_diagnostics.get("series_type_counts")),
+                "first_10_rows_sorted": _sample_rows(timeseries_diagnostics.get("first_10_rows_sorted"), limit=10),
+                "last_10_rows_sorted": _sample_rows(timeseries_diagnostics.get("last_10_rows_sorted"), limit=10),
+            },
         },
         "visualization": {
-            "status": _normalize_status(visualization_stage.get("status") or "unknown"),
-            "chart_type": str(chart_type or _safe_dict(visualization_stage.get("final_output")).get("selected_chart_type") or ""),
+            "status": _status_from_stage(stage_payload=visualization_stage, stage_exists=visualization_exists),
+            "chart_type": str(
+                _safe_dict(normalized_chart_config.get("chart_contract")).get("type")
+                or _safe_dict(normalized_chart_config.get("chart_contract")).get("chart_type")
+                or chart_type
+                or visualization_final.get("selected_chart_type")
+                or ""
+            ),
             "metabase_question_id": metabase_question_id,
+            "render_status": str(normalized_chart_config.get("render_status") or ""),
+            "contract_preserved": bool(normalized_chart_config.get("contract_preserved", False)),
             "metabase_dashboard_id": metabase_dashboard_id,
             "embed_url": str(embed_url or ""),
+            "config": {
+                "metabase_display": str(timeseries_diagnostics.get("metabase_display") or ""),
+                "semantic_chart_type": str(normalized_chart_config.get("semantic_chart_type") or ""),
+                "renderer_chart_type": str(normalized_chart_config.get("renderer_chart_type") or ""),
+                "histogram_strategy": str(normalized_chart_config.get("histogram_strategy") or ""),
+                "metric_column": str(normalized_chart_config.get("metric_column") or ""),
+                "bucket_column": str(normalized_chart_config.get("bucket_column") or ""),
+                "frequency_column": str(normalized_chart_config.get("frequency_column") or ""),
+                "bin_size": normalized_chart_config.get("bin_size"),
+                "bins_count": normalized_chart_config.get("bins_count"),
+                "graph_dimensions": _safe_list(timeseries_diagnostics.get("graph_dimensions")),
+                "graph_metrics": _safe_list(timeseries_diagnostics.get("graph_metrics")),
+                "graph_breakout": _safe_list(timeseries_diagnostics.get("graph_breakout")),
+            },
         },
+        "chart_decision_trace": chart_decision_trace,
+        "upstream_chart": chart_decision_trace.get("upstream_chart", ""),
+        "final_chart": chart_decision_trace.get("final_chart", ""),
+        "chart_locked": bool(chart_decision_trace.get("chart_locked", False)),
+        "overwritten": bool(chart_decision_trace.get("overwritten", False)),
+        "overwritten_by": chart_decision_trace.get("overwritten_by", ""),
+        "fallback_reason": chart_decision_trace.get("fallback_reason", ""),
+        "downgrade_reason": chart_decision_trace.get("downgrade_reason", ""),
         "errors": [],
         "meta": {
             "sample_limit": MAX_TRACE_SAMPLE_ROWS,
@@ -478,6 +728,10 @@ def build_ai_trace_payload(
     }
 
     if forecasting_trace:
+        forecasting_trace["forecast_status"] = _status_from_stage(
+            stage_payload=forecasting_stage,
+            stage_exists=forecasting_exists,
+        )
         trace["forecasting"] = forecasting_trace
 
     trace["errors"] = _collect_errors(

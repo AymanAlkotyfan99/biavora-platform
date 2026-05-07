@@ -288,8 +288,14 @@ function DashboardViewer() {
 
               {selectedReport.embed_url ? (
                 <div className="border-2 border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
+                  {(selectedReport.visualization_status === 'partial_success' ||
+                    (selectedReport.final_chart_type && selectedReport.metabase_display && selectedReport.final_chart_type !== selectedReport.metabase_display)) && (
+                    <div className="p-3 text-sm bg-yellow-50 dark:bg-yellow-900/20 border-b border-yellow-200 dark:border-yellow-800 text-yellow-800 dark:text-yellow-300">
+                      Visualization warning: metadata and rendered display do not match yet.
+                    </div>
+                  )}
                   <iframe
-                    key={`${selectedReport.id}-${selectedReport.embed_url}`}
+                    key={`${selectedReport.metabase_question_id || selectedReport.id}-${selectedReport.final_chart_type || selectedReport.chart_type}-${selectedReport.embed_url}-${selectedReport.updated_at || ''}`}
                     src={selectedReport.embed_url}
                     width="100%"
                     height="520"
@@ -341,7 +347,7 @@ function DashboardViewer() {
                       </p>
                       {report.row_count && (
                         <p className="text-xs text-gray-500 dark:text-gray-500 mt-1">
-                          {report.row_count.toLocaleString()} rows - {report.chart_type} chart
+                          {report.row_count.toLocaleString()} rows - {(report.final_chart_type || report.chart_type)} chart
                         </p>
                       )}
                     </div>

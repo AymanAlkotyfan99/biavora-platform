@@ -5,7 +5,7 @@ from django.urls import include, path
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('voice-reports/', include('voice_reports.report_urls')),
+    path('voice-reports/', include('voice_reports.urls')),
 ]
 
 if settings.DEBUG:

@@ -62,23 +62,12 @@ def resolve_target(path: str) -> Optional[RouteTarget]:
     if path.startswith('/database/') or path.startswith('/query/'):
         return RouteTarget(service='query-service', base_url=QUERY_SERVICE_URL)
 
-    if (
-        path == '/voice-reports/upload/'
-        or path == '/voice-reports/health/'
-        or path == VOICE_TEXT_QUERY_PATH
-        or VOICE_EXECUTE_PATTERN.match(path)
-    ):
+    # Report lifecycle ownership:
+    # - voice-service is the authoritative owner for create/execute/retrieve/trace/dashboard
+    # - report-service remains available for internal compatibility only
+    # This avoids split-brain behavior where execution and retrieval diverge.
+    if path.startswith('/voice-reports/'):
         return RouteTarget(service='voice-service', base_url=VOICE_SERVICE_URL)
-
-    if (
-        path.startswith('/voice-reports/reports/')
-        or path == '/voice-reports/dashboard/'
-        or path == '/voice-reports/dashboard/stats/'
-        or VOICE_SQL_PATTERN.match(path)
-        or VOICE_AI_TRACE_PATTERN.match(path)
-        or VOICE_DETAIL_PATTERN.match(path)
-    ):
-        return RouteTarget(service='report-service', base_url=REPORT_SERVICE_URL)
 
     if path.startswith('/visualization/'):
         return RouteTarget(service='visualization-service', base_url=VISUALIZATION_SERVICE_URL)

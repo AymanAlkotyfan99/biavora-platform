@@ -25,3 +25,4 @@ pydantic
 
 clickhouse-driver
 clickhouse-connect
+sqlglot>=25.17.0

@@ -6,15 +6,17 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000
 // Create axios instance
 const apiClient = axios.create({
   baseURL: API_BASE_URL,
-  headers: {
-    'Content-Type': 'application/json',
-  },
   // withCredentials removed - not needed for JWT authentication
 })
 
 // Request interceptor - Add JWT token to requests
 apiClient.interceptors.request.use(
   (config) => {
+    if (typeof FormData !== 'undefined' && config?.data instanceof FormData && config?.headers) {
+      // Let the browser set multipart boundaries automatically.
+      delete config.headers['Content-Type']
+      delete config.headers['content-type']
+    }
     const token = localStorage.getItem('access_token')
     if (token) {
       config.headers.Authorization = `Bearer ${token}`

@@ -6,7 +6,7 @@ import {
   RefreshCw, X, AlertTriangle
 } from 'lucide-react'
 import { databaseAPI } from '../../api/endpoints'
-import toast from 'react-hot-toast'
+import { toast } from 'react-toastify'
 import { fadeIn, cardVariants, scaleIn } from '../../animations/variants'
 import { Card, Button, Modal, LoadingSpinner } from '../../components'
 

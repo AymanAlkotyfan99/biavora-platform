@@ -7,6 +7,13 @@ from typing import Callable
 
 import requests
 
+try:  # pragma: no cover
+    from bi_platform_shared.http import HttpClientError, get_default_client
+    _SHARED_CLIENT_AVAILABLE = True
+except Exception:  # pragma: no cover
+    HttpClientError = Exception  # type: ignore[assignment,misc]
+    _SHARED_CLIENT_AVAILABLE = False
+
 from preprocessing_high.error_handler import (
     PreprocessHighLLMError,
     PreprocessHighSystemError,
@@ -115,6 +122,22 @@ _DETERMINISTIC_FALLBACK_STOP_TOKENS = {
     "alongside",
     "simultaneously",
     "concurrently",
+    "share",
+    "percentage",
+    "percent",
+    "ratio",
+    "cumulative",
+    "accumulated",
+    "stack",
+    "stacked",
+    "chart",
+    "charts",
+    "line",
+    "lines",
+    "bar",
+    "bars",
+    "combo",
+    "mixed",
 }
 _SEMANTIC_MAPPING_MIN_SCORE = 2.0
 _SEMANTIC_MAPPING_MIN_MARGIN = 0.25
@@ -194,17 +217,27 @@ def _call_ollama(
     )
 
     try:
-        response = requests.post(
-            config.ollama_url,
-            json=payload,
-            timeout=config.request_timeout_seconds,
-        )
+        if _SHARED_CLIENT_AVAILABLE:
+            response = get_default_client().post(
+                config.ollama_url,
+                json=payload,
+                timeout=(min(5.0, float(config.request_timeout_seconds)), float(config.request_timeout_seconds)),
+                attach_internal_api_key=False,
+            )
+        else:
+            response = requests.post(
+                config.ollama_url,
+                json=payload,
+                timeout=config.request_timeout_seconds,
+            )
     except requests.Timeout as exc:
         raise PreprocessHighSystemError(
             f"Ollama timeout during {purpose} after {config.request_timeout_seconds}s."
         ) from exc
     except requests.ConnectionError as exc:
         raise PreprocessHighSystemError(f"Ollama connection error during {purpose}.") from exc
+    except HttpClientError as exc:  # type: ignore[misc]
+        raise PreprocessHighSystemError(f"Ollama HTTP failure during {purpose}: {exc}") from exc
     except requests.RequestException as exc:
         raise PreprocessHighSystemError(f"Ollama request failure during {purpose}.") from exc
 
@@ -296,6 +329,14 @@ def _extract_query_shape(query: str) -> dict[str, Any]:
         ranking_direction = "DESC"
     elif any(word in normalized for word in ("lowest", "smallest", "least", "bottom", "worst")):
         ranking_direction = "ASC"
+    has_time_series_language = bool(
+        re.search(r"\bover\s+time\b", normalized)
+        or re.search(r"\btrend(s)?\b", normalized)
+        or re.search(r"\bby\s+date\b", normalized)
+        or re.search(r"\bby\s+day\b", normalized)
+        or re.search(r"\b(daily|weekly|monthly|quarterly|yearly|annually)\b", normalized)
+        or re.search(r"\b(per|by)\s+(day|week|month|quarter|year)\b", normalized)
+    )
     return {
         "numeric_limits": numeric_limits,
         "explicit_numbers": explicit_numbers,
@@ -303,6 +344,7 @@ def _extract_query_shape(query: str) -> dict[str, Any]:
         "has_comparison": has_comparison,
         "ranking_direction": ranking_direction,
         "has_ranking_language": any(word in normalized for word in _RANKING_WORDS),
+        "has_time_series_language": has_time_series_language,
     }
 
 
@@ -321,6 +363,8 @@ def _is_correction_structure_safe(original_query: str, corrected_query: str) -> 
     if source["has_comparison"] and not corrected["has_comparison"]:
         return False
     if source["explicit_numbers"] and corrected["explicit_numbers"] and source["explicit_numbers"] != corrected["explicit_numbers"]:
+        return False
+    if source.get("has_time_series_language") and not corrected.get("has_time_series_language"):
         return False
     return True
 

@@ -1,11 +1,13 @@
+from __future__ import annotations
+
 import re
 
-
-# Matches basic FROM/JOIN table references in SELECT queries.
-TABLE_REF_PATTERN = re.compile(
-    r"\b(FROM|JOIN)\s+(`?[A-Za-z_][A-Za-z0-9_\.]*`?)",
-    flags=re.IGNORECASE,
-)
+try:
+    import sqlglot
+    from sqlglot import exp
+except Exception:  # pragma: no cover
+    sqlglot = None
+    exp = None
 
 
 def normalize_table_name(table_name: str, default_db: str) -> str:
@@ -26,29 +28,58 @@ def normalize_table_name(table_name: str, default_db: str) -> str:
     parts = [part for part in cleaned.split(".") if part]
 
     if len(parts) == 1:
-        normalized = f"{default_db}.{parts[0]}"
-    elif len(parts) == 2:
-        normalized = f"{parts[0]}.{parts[1]}"
-    else:
-        normalized = f"{parts[-2]}.{parts[-1]}"
-
-    return normalized
+        return f"{default_db}.{parts[0]}"
+    if len(parts) == 2:
+        return f"{parts[0]}.{parts[1]}"
+    return f"{parts[-2]}.{parts[-1]}"
 
 
 def normalize_sql_table_references(sql: str, default_db: str) -> str:
     """
-    Normalize table references in FROM/JOIN clauses.
+    Normalize physical table references in SELECT/WITH SQL without rewriting CTE aliases.
     """
-    if not sql or not sql.strip():
+    if not sql or not sql.strip() or not default_db or not default_db.strip():
+        return sql
+    if sqlglot is None or exp is None:
+        cte_names = {
+            match.group(1).strip("`").lower()
+            for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(", sql, flags=re.IGNORECASE)
+        }
+
+        def _replace(match: re.Match) -> str:
+            clause = match.group(1)
+            raw_table = match.group(2)
+            table_name = raw_table.strip("`")
+            if table_name.lower() in cte_names or "." in table_name:
+                return match.group(0)
+            return f"{clause} {normalize_table_name(table_name, default_db)}"
+
+        return re.sub(
+            r"\b(FROM|JOIN)\s+(`?[A-Za-z_][A-Za-z0-9_\.]*`?)",
+            _replace,
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+    parsed = sqlglot.parse_one(sql, read="clickhouse")
+    if parsed is None:
         return sql
 
-    def _replace(match: re.Match) -> str:
-        clause = match.group(1)
-        raw_table = match.group(2)
-        quote = "`" if raw_table.startswith("`") and raw_table.endswith("`") else ""
-        normalized = normalize_table_name(raw_table.strip("`"), default_db)
-        if quote:
-            normalized = f"`{normalized}`"
-        return f"{clause} {normalized}"
+    cte_names = {
+        str(getattr(cte, "alias_or_name", "") or "").strip().strip("`").lower()
+        for cte in parsed.find_all(exp.CTE)
+        if str(getattr(cte, "alias_or_name", "") or "").strip()
+    }
 
-    return TABLE_REF_PATTERN.sub(_replace, sql)
+    changed = False
+    for table in parsed.find_all(exp.Table):
+        db_name = str(table.db or "").strip().strip("`")
+        table_name = str(table.name or "").strip().strip("`")
+        if not table_name or db_name or table_name.lower() in cte_names:
+            continue
+        db_part, table_part = normalize_table_name(table_name, default_db).split(".", 1)
+        table.set("db", exp.to_identifier(db_part))
+        table.set("this", exp.to_identifier(table_part))
+        changed = True
+
+    return parsed.sql(dialect="clickhouse") if changed else sql

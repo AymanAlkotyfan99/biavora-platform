@@ -13,17 +13,25 @@ class VoiceReport(models.Model):
     
     CHART_CHOICES = [
         (ChartType.LINE, 'Line Chart'),
+        (ChartType.LINE_MULTI, 'Multi-Line Chart'),
         (ChartType.BAR, 'Bar Chart'),
+        (ChartType.BAR_GROUPED, 'Grouped Bar Chart'),
+        (ChartType.BAR_STACKED, 'Stacked Bar Chart'),
+        (ChartType.PIE, 'Pie Chart'),
+        (ChartType.AREA, 'Area Chart'),
+        (ChartType.MAP, 'Map'),
+        (ChartType.COMBO_LINE_BAR, 'Combo Line/Bar Chart'),
         (ChartType.CARD, 'Card'),
         (ChartType.TABLE, 'Table'),
         (ChartType.SCATTER, 'Scatter Plot'),
         (ChartType.HISTOGRAM, 'Histogram'),
         # Legacy chart values kept for backward compatibility with old rows.
         ('kpi', 'Legacy KPI'),
-        ('pie', 'Legacy Pie'),
         ('number', 'Legacy Number/KPI'),
         ('scalar', 'Legacy Scalar'),
         ('grouped_bar', 'Legacy Grouped Bar'),
+        ('stacked_bar', 'Legacy Stacked Bar'),
+        ('combo', 'Legacy Combo'),
     ]
 
     STATUS_UPLOADED = 'uploaded'
@@ -270,4 +278,70 @@ class ReportPageAssignment(models.Model):
     
     def __str__(self):
         return f"{self.report} → {self.page}"
+
+
+class VoicePipelineJob(models.Model):
+    STATUS_PENDING = "PENDING"
+    STATUS_QUEUED = "QUEUED"
+    STATUS_TRANSCRIBING = "TRANSCRIBING"
+    STATUS_AI_PROCESSING = "AI_PROCESSING"
+    STATUS_SQL_GENERATED = "SQL_GENERATED"
+    STATUS_EXECUTING_QUERY = "EXECUTING_QUERY"
+    STATUS_VISUALIZING = "VISUALIZING"
+    STATUS_COMPLETED = "COMPLETED"
+    STATUS_FAILED = "FAILED"
+    STATUS_PARTIAL = "PARTIAL"
+
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_QUEUED, "Queued"),
+        (STATUS_TRANSCRIBING, "Transcribing"),
+        (STATUS_AI_PROCESSING, "AI Processing"),
+        (STATUS_SQL_GENERATED, "SQL Generated"),
+        (STATUS_EXECUTING_QUERY, "Executing Query"),
+        (STATUS_VISUALIZING, "Visualizing"),
+        (STATUS_COMPLETED, "Completed"),
+        (STATUS_FAILED, "Failed"),
+        (STATUS_PARTIAL, "Partial"),
+    ]
+
+    INPUT_TYPE_AUDIO = "audio"
+    INPUT_TYPE_TEXT = "text"
+    INPUT_TYPE_CHOICES = [
+        (INPUT_TYPE_AUDIO, "Audio"),
+        (INPUT_TYPE_TEXT, "Text"),
+    ]
+
+    job_id = models.UUIDField(unique=True, db_index=True)
+    report = models.ForeignKey(VoiceReport, on_delete=models.CASCADE, related_name="jobs")
+    workspace = models.ForeignKey(Workspace, on_delete=models.CASCADE, related_name="voice_pipeline_jobs")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="voice_pipeline_jobs")
+    status = models.CharField(max_length=32, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    current_stage = models.CharField(max_length=64, blank=True, default=STATUS_PENDING)
+    input_type = models.CharField(max_length=16, choices=INPUT_TYPE_CHOICES)
+    original_question = models.TextField(blank=True)
+    cleaned_question = models.TextField(blank=True)
+    generated_sql = models.TextField(blank=True)
+    execution_result_summary = models.JSONField(null=True, blank=True)
+    visualization_id = models.CharField(max_length=128, blank=True)
+    progress = models.PositiveSmallIntegerField(default=0)
+    retry_count = models.PositiveIntegerField(default=0)
+    error_code = models.CharField(max_length=128, blank=True)
+    error_message = models.TextField(blank=True)
+    trace = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "voice_pipeline_jobs"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["workspace", "status"]),
+            models.Index(fields=["user", "status"]),
+            models.Index(fields=["report"]),
+        ]
+
+    def __str__(self):
+        return f"{self.job_id} ({self.status})"
 

@@ -6,16 +6,45 @@ Metabase Self-Hosted Integration Service
 - In-memory session caching with TTL
 - Auto re-auth on 401
 - Graceful fallback with structured last_error
+
+Phase 13 / GAP-03 — Metabase fallback:
+
+* When Metabase is unreachable (health check fails), ``create_question``
+  now returns the structured value ``MetabaseFallbackResult`` (a dict with
+  ``status="degraded"``, ``error_code="metabase_unavailable"``, and the
+  raw SQL/columns/rows preserved) instead of returning ``None`` and losing
+  the result. Voice-service can then render a typed "results-without-chart"
+  response so users still see the data.
+* All outbound HTTP calls go through the shared HTTP client (Phase 13 /
+  GAP-05) which provides retries with exponential backoff, circuit
+  breakers, and W3C Trace Context propagation.
 """
 
 import json
 import logging
 import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
+from bi_platform_shared.sql import sanitize_sql_for_metabase
+
+# Phase 13 / GAP-05: prefer the shared HTTP client which provides retries,
+# circuit breakers and W3C Trace Context propagation. Fall back to the
+# stdlib ``requests`` package when the shared package is not on PYTHONPATH
+# (e.g. unit tests that import ``metabase_service`` in isolation).
+try:
+    from bi_platform_shared.http import get_default_client as _get_shared_http_client
+    from bi_platform_shared.http.client import CircuitBreakerOpenError, HttpClientError
+except Exception:  # pragma: no cover
+    _get_shared_http_client = None  # type: ignore[assignment]
+
+    class HttpClientError(Exception):
+        """Fallback when bi_platform_shared is not installed."""
+
+    class CircuitBreakerOpenError(HttpClientError):
+        """Fallback when bi_platform_shared is not installed."""
+
 
 import requests
-
 logger = logging.getLogger(__name__)
 
 _session_token: Optional[str] = None
@@ -28,19 +57,27 @@ METABASE_SESSION_TTL_SECONDS = int(os.getenv("METABASE_SESSION_TTL_SECONDS", "18
 
 CHART_TYPE_MAPPING: Dict[str, str] = {
     "line": "line",
+    "line_multi": "line",
     "bar": "bar",
+    "bar_grouped": "bar",
+    "bar_stacked": "bar",
+    "pie": "pie",
+    "area": "area",
     "scatter": "scatter",
+    "bubble": "scatter",
     "histogram": "histogram",
+    "map": "map",
+    "combo_line_bar": "combo",
+    "combo": "combo",
     "kpi": "scalar",
     "card": "scalar",
     "scalar": "scalar",
     "number": "scalar",
     "grouped_bar": "bar",
+    "stacked_bar": "bar",
     "table": "table",
 }
-SUPPORTED_DISPLAYS = {"line", "bar", "scatter", "scalar", "table", "histogram"}
-DEFAULT_FALLBACK_DISPLAY = "table"
-
+SUPPORTED_DISPLAYS = {"line", "bar", "scatter", "scalar", "table", "histogram", "pie", "area", "map", "combo"}
 
 def _metabase_base_url() -> str:
     return (os.getenv("METABASE_URL") or "http://localhost:3000").rstrip("/")
@@ -59,18 +96,106 @@ def _credentials() -> tuple[Optional[str], Optional[str]]:
     return os.getenv("METABASE_USERNAME"), os.getenv("METABASE_PASSWORD")
 
 
+def _http_get(url: str, *, timeout: int) -> Optional[requests.Response]:
+    """Phase 13 / GAP-05: route GETs through the shared HTTP client when
+    available; fall back to the stdlib ``requests`` package otherwise.
+    """
+
+    if _get_shared_http_client is not None:
+        try:
+            client = _get_shared_http_client()
+            return client.get(url, timeout=(min(5.0, timeout), float(timeout)), attach_internal_api_key=False)
+        except CircuitBreakerOpenError as exc:
+            logger.warning("metabase_http_breaker_open url=%s err=%s", url, exc)
+            return None
+        except HttpClientError as exc:
+            logger.warning("metabase_http_client_error url=%s err=%s", url, exc)
+            return None
+    return requests.get(url, timeout=timeout)
+
+
+def _http_request(
+    method: str,
+    url: str,
+    *,
+    headers: Dict[str, str],
+    json: Optional[Dict[str, Any]] = None,
+    timeout_seconds: int = METABASE_TIMEOUT_SECONDS,
+) -> Optional[requests.Response]:
+    """GAP-05: Metabase API calls (non-health) via shared client when installed."""
+
+    timeout_pair = (min(5.0, float(timeout_seconds)), float(timeout_seconds))
+    if _get_shared_http_client is not None:
+        try:
+            client = _get_shared_http_client()
+            if json is not None and method.upper() != "GET":
+                return client.request(
+                    method,
+                    url,
+                    headers=headers,
+                    json=json,
+                    timeout=timeout_pair,
+                    attach_internal_api_key=False,
+                )
+            return client.request(
+                method,
+                url,
+                headers=headers,
+                timeout=timeout_pair,
+                attach_internal_api_key=False,
+            )
+        except CircuitBreakerOpenError as exc:
+            logger.warning("metabase_http_breaker_open method=%s url=%s err=%s", method, url, exc)
+            return None
+        except HttpClientError as exc:
+            logger.warning("metabase_http_client_error method=%s url=%s err=%s", method, url, exc)
+            return None
+    kwargs: Dict[str, Any] = {"headers": headers, "timeout": timeout_seconds}
+    if json is not None and method.upper() != "GET":
+        kwargs["json"] = json
+    return requests.request(method, url, **kwargs)
+
+
 def check_metabase_health(*, retries: int = METABASE_HEALTH_RETRIES) -> bool:
     url = f"{_metabase_base_url()}/api/health"
     for attempt in range(retries + 1):
         try:
-            response = requests.get(url, timeout=METABASE_TIMEOUT_SECONDS)
-            if response.status_code == 200:
+            response = _http_get(url, timeout=METABASE_TIMEOUT_SECONDS)
+            if response is not None and response.status_code == 200:
                 return True
         except Exception as exc:
             logger.warning("Metabase health check failed (attempt %s): %s", attempt + 1, exc)
         if attempt < retries:
             time.sleep(1 + attempt)
     return False
+
+
+def metabase_fallback_payload(
+    *,
+    error_code: str,
+    error_message: str,
+    sql: Optional[str] = None,
+    columns: Optional[list[str]] = None,
+    rows: Optional[list[Any]] = None,
+    chart_contract: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Phase 13 / GAP-03: typed fallback returned when Metabase is
+    unavailable so voice-service can render a "results-without-chart"
+    response instead of treating it as a hard failure.
+    """
+
+    return {
+        "status": "degraded",
+        "error_code": error_code,
+        "error_message": error_message,
+        "embed_url": None,
+        "metabase_card_id": None,
+        "sql": sql,
+        "columns": list(columns or []),
+        "rows": list(rows or []),
+        "chart_contract": chart_contract or {},
+        "fallback_owner": "visualization-service",
+    }
 
 
 def get_metabase_session(force_refresh: bool = False) -> Optional[str]:
@@ -99,12 +224,21 @@ def get_metabase_session(force_refresh: bool = False) -> Optional[str]:
 
     for attempt in range(METABASE_AUTH_RETRIES + 1):
         try:
-            response = requests.post(
-                session_url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=METABASE_TIMEOUT_SECONDS,
-            )
+            if _get_shared_http_client is not None:
+                response = _get_shared_http_client().post(
+                    session_url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=(min(5.0, float(METABASE_TIMEOUT_SECONDS)), float(METABASE_TIMEOUT_SECONDS)),
+                    attach_internal_api_key=False,
+                )
+            else:
+                response = requests.post(
+                    session_url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=METABASE_TIMEOUT_SECONDS,
+                )
             if response.status_code == 200:
                 data = response.json()
                 token = data.get("id")
@@ -183,6 +317,61 @@ class MetabaseService:
                 if stripped:
                     cleaned.append(stripped)
         return cleaned
+
+    @staticmethod
+    def _looks_like_hex_color(value: str) -> bool:
+        cleaned = value.strip()
+        if len(cleaned) != 7 or not cleaned.startswith("#"):
+            return False
+        return all(ch in "0123456789abcdefABCDEF" for ch in cleaned[1:])
+
+    def _apply_series_style_hints(self, settings: Dict[str, Any], *, display: str) -> None:
+        if display != "line":
+            return
+
+        series_config = settings.get("chart_series_config")
+        if not isinstance(series_config, list):
+            return
+
+        breakout = self._string_list(settings.get("graph.breakout"))
+        if not breakout:
+            series_field = str(settings.get("series_type_field") or "").strip()
+            if series_field:
+                breakout = [series_field]
+                settings["graph.breakout"] = breakout
+        if not breakout:
+            return
+
+        colors: list[str] = []
+        series_settings: Dict[str, Dict[str, Any]] = {}
+        for item in series_config:
+            if not isinstance(item, dict):
+                continue
+            series_type = str(item.get("series_type") or "").strip()
+            series_label = str(item.get("series_label") or "").strip()
+            preferred_color = str(item.get("preferred_color") or "").strip()
+            if not series_type or not self._looks_like_hex_color(preferred_color):
+                continue
+
+            colors.append(preferred_color)
+            style = {"color": preferred_color}
+            if series_label:
+                style["title"] = series_label
+            series_settings[series_type] = dict(style)
+            if series_label:
+                series_settings[series_label] = dict(style)
+
+        deduped_colors: list[str] = []
+        for color in colors:
+            if color not in deduped_colors:
+                deduped_colors.append(color)
+        if deduped_colors:
+            settings["graph.colors"] = deduped_colors
+        if series_settings:
+            existing = settings.get("series_settings")
+            merged = dict(existing) if isinstance(existing, dict) else {}
+            merged.update(series_settings)
+            settings["series_settings"] = merged
 
     @staticmethod
     def _extract_dataset_columns(settings: Dict[str, Any]) -> list[Dict[str, Any]]:
@@ -348,7 +537,35 @@ class MetabaseService:
         numeric_columns = self._string_list(settings.get("numeric_columns"))
         if category_columns and numeric_columns:
             return category_columns[0], numeric_columns[0]
+        time_columns = self._string_list(settings.get("time_columns"))
+        if time_columns and numeric_columns:
+            return time_columns[0], numeric_columns[0]
         return None, None
+
+    def _resolve_map_dimension_metric(self, settings: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+        dimensions = self._string_list(settings.get("graph.dimensions"))
+        metrics = self._string_list(settings.get("graph.metrics"))
+        if dimensions:
+            metric = metrics[0] if metrics else None
+            return dimensions[0], metric
+        geo_columns = self._string_list(settings.get("geo_columns"))
+        numeric_columns = self._string_list(settings.get("numeric_columns"))
+        if geo_columns:
+            metric = numeric_columns[0] if numeric_columns else None
+            return geo_columns[0], metric
+        return None, None
+
+    def _resolve_combo_dimension_metrics(self, settings: Dict[str, Any]) -> tuple[Optional[str], list[str]]:
+        dimensions = self._string_list(settings.get("graph.dimensions"))
+        metrics = self._string_list(settings.get("graph.metrics"))
+        if dimensions and len(metrics) >= 2:
+            return dimensions[0], metrics[:2]
+
+        time_columns = self._string_list(settings.get("time_columns"))
+        numeric_columns = self._string_list(settings.get("numeric_columns"))
+        if time_columns and len(numeric_columns) >= 2:
+            return time_columns[0], numeric_columns[:2]
+        return None, []
 
     def _resolve_histogram_metric(self, settings: Dict[str, Any]) -> Optional[str]:
         # Priority:
@@ -415,132 +632,170 @@ class MetabaseService:
         logger.warning("Histogram metric resolution fell through all strategies; no metric available.")
         return None
 
-    def _safe_display_from_shape(self, settings: Dict[str, Any]) -> str:
-        numeric_columns = self._string_list(settings.get("numeric_columns"))
-        time_columns = self._string_list(settings.get("time_columns"))
-        category_columns = self._string_list(settings.get("category_columns"))
-        row_count = int(settings.get("row_count") or 0)
+    def _prepare_visualization_settings(
+        self, visualization_settings: Optional[Dict[str, Any]]
+    ) -> Tuple[str, Dict[str, Any], Optional[str]]:
+        """Return (metabase_display, visualization_settings, error_code).
 
-        if time_columns and numeric_columns and row_count > 1:
-            settings["graph.dimensions"] = [time_columns[0]]
-            settings["graph.metrics"] = [numeric_columns[0]]
-            return "line"
-        if len(numeric_columns) >= 2 and row_count > 1:
-            settings["graph.dimensions"] = [numeric_columns[0]]
-            settings["graph.metrics"] = [numeric_columns[1]]
-            return "scatter"
-        if category_columns and numeric_columns:
-            settings["graph.dimensions"] = [category_columns[0]]
-            settings["graph.metrics"] = [numeric_columns[0]]
-            return "bar"
-        if numeric_columns and row_count > 1:
-            settings["graph.metrics"] = [numeric_columns[0]]
-            return "histogram"
-        if len(numeric_columns) == 1 and row_count == 1:
-            settings["graph.metrics"] = [numeric_columns[0]]
-            return "scalar"
-        return DEFAULT_FALLBACK_DISPLAY
+        Renderer-only policy: never change ``chart_type`` / ``final_chart_type`` from the
+        upstream contract. Missing axis bindings yield a non-empty error instead of silently
+        falling back to ``table``.
+        """
 
-    def _prepare_visualization_settings(self, visualization_settings: Optional[Dict[str, Any]]) -> tuple[str, Dict[str, Any]]:
         settings: Dict[str, Any] = dict(visualization_settings or {})
+        chart_config = settings.get("chart_config") if isinstance(settings.get("chart_config"), dict) else {}
+        chart_contract = settings.get("chart_contract") if isinstance(settings.get("chart_contract"), dict) else {}
+        merged_contract: Dict[str, Any] = {
+            **chart_config,
+            **chart_contract,
+        }
+        for flag in ("explicit_chart_lock", "chart_locked", "locked", "chart_lock"):
+            if flag in settings and flag not in merged_contract:
+                merged_contract[flag] = settings[flag]
 
-        requested_display = self._normalize_display(
-            settings.get("display") or settings.get("chart_type")
-        )
-        fallback_applied = False
-        fallback_reason = ""
-        if not requested_display:
-            requested_display = self._safe_display_from_shape(settings)
-            fallback_applied = True
-            fallback_reason = "missing_requested_display"
-            logger.info("No chart display provided; selected safe display '%s'", requested_display)
+        raw_upstream_chart = str(
+            merged_contract.get("chart_type")
+            or merged_contract.get("type")
+            or merged_contract.get("final_chart_type")
+            or merged_contract.get("selected_chart_type")
+            or settings.get("chart_type")
+            or settings.get("type")
+            or settings.get("final_chart_type")
+            or settings.get("selected_chart_type")
+            or ""
+        ).strip()
+        if not raw_upstream_chart:
+            logger.error("chart_contract_missing_cannot_prepare_metabase_payload")
+            return "", settings, "missing_upstream_chart_contract"
+        requested_chart_type = raw_upstream_chart.lower()
+        final_chart_type = requested_chart_type
+        logger.info("Visualization using upstream chart type: %s", final_chart_type)
 
-        display = requested_display
-        if display not in SUPPORTED_DISPLAYS:
-            fallback_applied = True
-            fallback_reason = f"unsupported_display:{requested_display}"
-            logger.warning(
-                "Unsupported chart display '%s'; falling back to '%s'",
-                requested_display,
-                self._safe_display_from_shape(settings),
+        # Preserve axis fields from chart contract unless explicitly provided at top-level settings.
+        for axis_key in ("x_axis", "label_column", "value_column", "time_column", "time_grain", "metric_type"):
+            if (axis_key not in settings or settings.get(axis_key) in (None, "", [])) and merged_contract.get(axis_key) not in (None, "", []):
+                settings[axis_key] = merged_contract.get(axis_key)
+        if "y_axis" not in settings or settings.get("y_axis") in (None, "", []):
+            y_from_contract = merged_contract.get("y_axis")
+            settings["y_axis"] = y_from_contract if isinstance(y_from_contract, list) else (
+                [str(y_from_contract).strip()] if isinstance(y_from_contract, str) and str(y_from_contract).strip() else []
             )
-            display = self._safe_display_from_shape(settings)
 
-        if display == "scatter":
-            x_column, y_column = self._resolve_scatter_axes(settings)
-            if not x_column or not y_column or x_column == y_column:
-                fallback_applied = True
-                fallback_reason = "invalid_scatter_shape"
-                logger.warning(
-                    "Invalid scatter configuration (x=%s, y=%s); choosing safe display",
-                    x_column,
-                    y_column,
-                )
-                display = self._safe_display_from_shape(settings)
-            else:
-                settings["graph.dimensions"] = [x_column]
-                settings["graph.metrics"] = [y_column]
-        elif display == "line":
-            time_dimension, metric_column = self._resolve_line_dimension_metric(settings)
-            if not time_dimension or not metric_column:
-                fallback_applied = True
-                fallback_reason = "invalid_line_shape"
-                logger.warning(
-                    "Invalid line configuration (time=%s, metric=%s); choosing safe fallback display",
-                    time_dimension,
-                    metric_column,
-                )
-                safe_display = self._safe_display_from_shape(settings)
-                if safe_display == "table" and requested_display == "line":
-                    display = "line"
-                    fallback_reason = "line_axes_unresolved_preserved"
-                else:
-                    display = safe_display
-            else:
-                settings["graph.dimensions"] = [time_dimension]
-                settings["graph.metrics"] = [metric_column]
-        elif display == "histogram":
-            metric_column = self._resolve_histogram_metric(settings)
-            if not metric_column:
-                fallback_applied = True
-                fallback_reason = "invalid_histogram_shape"
-                logger.warning("Histogram display requested but no metric could be resolved; choosing safe display.")
-                display = self._safe_display_from_shape(settings)
-            else:
-                settings["graph.metrics"] = [metric_column]
-                logger.info("Histogram metric resolved: %s", metric_column)
-        elif display == "bar":
-            dimension_column, metric_column = self._resolve_bar_dimension_metric(settings)
-            if not metric_column:
-                metric_column = self._resolve_histogram_metric(settings)
-            if not metric_column:
-                fallback_applied = True
-                fallback_reason = "invalid_bar_shape"
-                logger.warning(
-                    "Invalid bar configuration (dimension=%s, metric=%s); preserving explicit bar display",
-                    dimension_column,
-                    metric_column,
-                )
-            else:
-                settings["graph.metrics"] = [metric_column]
-                if dimension_column:
-                    settings["graph.dimensions"] = [dimension_column]
+        display = self._normalize_display(final_chart_type)
+        if not display or display not in SUPPORTED_DISPLAYS:
+            return "", settings, f"unsupported_metabase_display:{final_chart_type}"
 
+        # Build column families for strict validation/logging only.
+        dataset_columns = self._extract_dataset_columns(settings)
+        result_rows = self._extract_result_rows(settings)
+        dataset_column_names = [str(col.get("name") or "").strip() for col in dataset_columns if str(col.get("name") or "").strip()]
+        numeric_columns = self._dataset_numeric_columns(dataset_columns)
+        row_numeric_columns = self._result_row_numeric_columns(result_rows, dataset_column_names)
+        for candidate in row_numeric_columns:
+            if candidate not in numeric_columns:
+                numeric_columns.append(candidate)
+
+        candidate_names = list(dataset_column_names)
+        if not candidate_names and result_rows:
+            candidate_names = [str(key).strip() for key in result_rows[0].keys() if str(key).strip()]
+        time_columns = [
+            name for name in candidate_names
+            if any(token in name.lower() for token in ("date", "time", "period", "day", "week", "month", "year", "ds"))
+        ]
+        geo_columns = [
+            name for name in candidate_names
+            if any(token in name.lower() for token in ("lat", "lng", "lon", "country", "state", "city", "geo", "location"))
+        ]
+        category_columns = [name for name in candidate_names if name not in numeric_columns]
+        settings["numeric_columns"] = numeric_columns
+        settings["time_columns"] = time_columns
+        settings["geo_columns"] = geo_columns
+        settings["category_columns"] = category_columns
+
+        graph_contract = settings.get("graph") if isinstance(settings.get("graph"), dict) else {}
+        graph_dimensions = self._string_list(graph_contract.get("dimensions") or settings.get("graph.dimensions"))
+        graph_metrics = self._string_list(graph_contract.get("metrics") or settings.get("graph.metrics"))
+        if not graph_dimensions:
+            x_axis = str(settings.get("x_axis") or "").strip()
+            if x_axis:
+                graph_dimensions = [x_axis]
+        if not graph_metrics:
+            y_axis = self._string_list(settings.get("y_axis"))
+            if y_axis:
+                graph_metrics = y_axis
+        label_column = str(settings.get("label_column") or "").strip()
+        value_column = str(settings.get("value_column") or "").strip()
+        if not graph_dimensions:
+            if final_chart_type == "pie":
+                return "", settings, "missing_required_label_value_bindings:pie"
+            return "", settings, f"missing_required_axis_bindings:{final_chart_type}"
+        if final_chart_type == "pie":
+            label = label_column or graph_dimensions[0]
+            value = value_column or (graph_metrics[0] if graph_metrics else "")
+            if not label or not value:
+                return "", settings, "missing_required_label_value_bindings:pie"
+            settings["label_column"] = label
+            settings["value_column"] = value
+            graph_dimensions = [label]
+            graph_metrics = [value]
+        elif not graph_metrics:
+            return "", settings, f"missing_required_axis_bindings:{final_chart_type}"
+
+        settings["graph.dimensions"] = list(graph_dimensions)
+        settings["graph.metrics"] = list(graph_metrics)
+
+        settings["selected_chart_type"] = final_chart_type
+        settings["chart_type"] = final_chart_type
+        settings["final_chart_type"] = final_chart_type
         settings["display"] = display
-        settings["requested_display"] = requested_display
-        settings["fallback_applied"] = fallback_applied
-        settings["fallback_reason"] = fallback_reason
+        settings["requested_display"] = display
+        settings["chart_locked"] = bool(settings.get("chart_locked", settings.get("explicit_chart_lock", True)))
+        settings["explicit_chart_lock"] = bool(settings.get("explicit_chart_lock", merged_contract.get("locked", True)))
+        settings["fallback_reason"] = ""
+        settings["fallback_applied"] = False
+        settings["overwritten_by"] = ""
+        if str(settings.get("metric_type", "")).strip().lower() in {"percentage", "percent", "ratio"} and display == "pie":
+            settings["value_format"] = "percent"
+
+        self._apply_series_style_hints(settings, display=display)
+        existing_trace = settings.get("chart_decision_trace")
+        chart_trace = dict(existing_trace) if isinstance(existing_trace, dict) else {}
+        chain = chart_trace.get("decision_chain")
+        normalized_chain = list(chain) if isinstance(chain, list) else []
+        normalized_chain.append(
+            {
+                "stage": "visualization-service",
+                "chart": final_chart_type,
+                "action": "sent_to_metabase",
+                "reason": "renderer_only",
+            }
+        )
+        chart_trace.update(
+            {
+                "upstream_chart": requested_chart_type,
+                "initial_selected_chart": requested_chart_type,
+                "final_chart": final_chart_type,
+                "chart_locked": bool(settings.get("chart_locked")),
+                "explicit_chart_lock": bool(settings.get("explicit_chart_lock")),
+                "overwritten": False,
+                "overwritten_by": None,
+                "reason": "renderer_only",
+                "fallback_reason": None,
+                "decision_chain": normalized_chain,
+            }
+        )
+        settings["chart_decision_trace"] = chart_trace
         self.last_display = display
-        self.last_fallback_applied = fallback_applied
-        self.last_fallback_reason = fallback_reason
+        self.last_fallback_applied = False
+        self.last_fallback_reason = ""
         logger.info(
             "chart_selection_result display=%s fallback_applied=%s fallback_reason=%s requested_display=%s",
             display,
-            fallback_applied,
-            fallback_reason,
-            requested_display,
+            self.last_fallback_applied,
+            self.last_fallback_reason,
+            display,
         )
-        return display, settings
+        return display, settings, None
 
     def health_check(self) -> bool:
         healthy = check_metabase_health()
@@ -569,31 +824,31 @@ class MetabaseService:
             self._set_last_error("metabase_authentication_failed")
             return None
 
-        try:
-            kwargs: Dict[str, Any] = {"headers": headers, "timeout": METABASE_TIMEOUT_SECONDS}
-            if json is not None and method.upper() != "GET":
-                kwargs["json"] = json
-            response = requests.request(method, url, **kwargs)
-        except Exception as exc:
-            self._set_last_error(f"metabase_request_error: {exc}")
-            logger.error("Metabase request error %s %s: %s", method, path, exc)
+        response = _http_request(method, url, headers=headers, json=json, timeout_seconds=METABASE_TIMEOUT_SECONDS)
+        if response is None:
+            self._set_last_error("metabase_request_error")
             return None
 
         if response.status_code == 401 and retry_on_401:
             clear_metabase_session()
             if get_metabase_session(force_refresh=True):
                 headers = self._headers()
-                kwargs["headers"] = headers
-                try:
-                    response = requests.request(method, url, **kwargs)
-                except Exception as exc:
-                    self._set_last_error(f"metabase_request_error_after_refresh: {exc}")
-                    logger.error("Metabase retry request error %s %s: %s", method, path, exc)
+                response = _http_request(method, url, headers=headers, json=json, timeout_seconds=METABASE_TIMEOUT_SECONDS)
+                if response is None:
+                    self._set_last_error("metabase_request_error_after_refresh")
+                    logger.error("Metabase retry request failed %s %s", method, path)
                     return None
             else:
                 self._set_last_error("metabase_authentication_failed")
                 return None
 
+        if response.status_code in {502, 503, 504}:
+            time.sleep(1)
+            response = _http_request(method, url, headers=headers, json=json, timeout_seconds=METABASE_TIMEOUT_SECONDS)
+            if response is None:
+                self._set_last_error("metabase_request_error_retry")
+                logger.error("Metabase retry after 5xx failed %s %s", method, path)
+                return None
         return response
 
     def authenticate(self, username: Optional[str] = None, password: Optional[str] = None) -> bool:
@@ -613,13 +868,25 @@ class MetabaseService:
         visualization_settings: Optional[Dict] = None,
     ) -> Optional[int]:
         self._set_last_error(None)
-        display, normalized_visualization_settings = self._prepare_visualization_settings(visualization_settings)
+        if not str(name or "").strip() or not str(sql or "").strip():
+            self._set_last_error("invalid_payload:name_and_sql_required")
+            return None
+        display, normalized_visualization_settings, prep_error = self._prepare_visualization_settings(visualization_settings)
+        if prep_error:
+            self._set_last_error(prep_error)
+            return None
+
+        sanitized_sql = sanitize_sql_for_metabase(sql)
+        if str(sql or "").strip().endswith(";"):
+            logger.warning("Trailing semicolon detected and removed for Metabase compatibility")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Metabase SQL sanitization original_sql=%r sanitized_sql=%r", sql, sanitized_sql)
 
         payload: Dict[str, Any] = {
             "name": name,
             "dataset_query": {
                 "type": "native",
-                "native": {"query": sql},
+                "native": {"query": sanitized_sql},
                 "database": self.database_id,
             },
             "display": display,
@@ -630,16 +897,13 @@ class MetabaseService:
             payload["description"] = clean_description
 
         logger.info(
-            "Creating Metabase question: name=%s database_id=%s display=%s sql_len=%s chart_selected=%s fallback_applied=%s",
+            "Creating Metabase question: name=%s database_id=%s display=%s sql_len=%s chart_selected=%s prep_error=%s",
             name,
             self.database_id,
             payload.get("display"),
-            len(sql or ""),
+            len(sanitized_sql or ""),
             visualization_settings.get("chart_type") if isinstance(visualization_settings, dict) else "",
-            bool(
-                isinstance(normalized_visualization_settings, dict)
-                and normalized_visualization_settings.get("display") != (visualization_settings or {}).get("display")
-            ),
+            "",
         )
         response = self._request("POST", "/api/card", json=payload)
         if response and response.status_code in (200, 201):
@@ -670,13 +934,22 @@ class MetabaseService:
         visualization_settings: Optional[Dict] = None,
     ) -> bool:
         self._set_last_error(None)
-        display, normalized_visualization_settings = self._prepare_visualization_settings(visualization_settings)
+        display, normalized_visualization_settings, prep_error = self._prepare_visualization_settings(visualization_settings)
+        if prep_error:
+            self._set_last_error(prep_error)
+            return False
+
+        sanitized_sql = sanitize_sql_for_metabase(sql)
+        if str(sql or "").strip().endswith(";"):
+            logger.warning("Trailing semicolon detected and removed for Metabase compatibility")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Metabase SQL sanitization original_sql=%r sanitized_sql=%r", sql, sanitized_sql)
 
         payload: Dict[str, Any] = {
             "name": name,
             "dataset_query": {
                 "type": "native",
-                "native": {"query": sql},
+                "native": {"query": sanitized_sql},
                 "database": self.database_id,
             },
             "display": display,
@@ -741,6 +1014,19 @@ class MetabaseService:
         size_x: int = 6,
         size_y: int = 4,
     ) -> bool:
+        self._set_last_error(None)
+        if not isinstance(question_id, int) or question_id <= 0:
+            self._set_last_error("add_to_dashboard_failed: invalid_question_id")
+            return False
+        if not isinstance(dashboard_id, int) or dashboard_id <= 0:
+            self._set_last_error("add_to_dashboard_failed: invalid_dashboard_id")
+            return False
+        if self.get_dashboard(dashboard_id) is None:
+            self._set_last_error("add_to_dashboard_failed: dashboard_not_found")
+            return False
+        if self.get_card(question_id) is None:
+            self._set_last_error("add_to_dashboard_failed: card_not_found")
+            return False
         payload = {
             "cardId": question_id,
             "row": row,
@@ -753,6 +1039,15 @@ class MetabaseService:
             return True
         if response:
             details = self._extract_error_details(response)
+            logger.error(
+                "Metabase add-to-dashboard failed endpoint=%s status=%s dashboard_id=%s card_id=%s payload_keys=%s response=%s",
+                f"/api/dashboard/{dashboard_id}/cards",
+                response.status_code,
+                dashboard_id,
+                question_id,
+                sorted(payload.keys()),
+                details[:300],
+            )
             self._set_last_error(f"add_to_dashboard_failed: {details}")
         elif self.last_error is None:
             self._set_last_error("add_to_dashboard_failed: no_response")
@@ -825,3 +1120,4 @@ def get_metabase_service() -> MetabaseService:
     if _metabase_service is None:
         _metabase_service = MetabaseService()
     return _metabase_service
+

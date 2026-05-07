@@ -1,9 +1,37 @@
-﻿from __future__ import annotations
+﻿"""Pipeline trace builder (Phase 10).
 
+Phase 10 changes versus the legacy implementation:
+
+1. Every trace carries a ``trace_version`` (``"2.0"``). Consumers can use it
+   to evolve the schema safely.
+2. Persistence helpers (``select_trace_for_persistence``) reject trace
+   payloads with an *older* version than the one already stored, so a slow
+   late-arriving response can no longer overwrite a fresher trace.
+3. Unknown versions emit a structured warning instead of silently passing
+   through.
+4. ``schema_provenance`` is a first-class section so we can detect schema
+   drift (audit §12.5) and so the frontend can show which schema fingerprint
+   produced the answer.
+"""
+
+from __future__ import annotations
+
+import logging
 from copy import deepcopy
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
+
 from shared.stage_contract import normalize_stage_status
+
+
+logger = logging.getLogger("ai_service.pipeline_trace")
+
+
+# Phase 10 / §12.3: every trace emitted by ai-service is tagged with this
+# version so downstream consumers can compare and reject older overwrites.
+TRACE_VERSION = "2.0"
+
+KNOWN_TRACE_VERSIONS = ("1.0", "2.0")
 
 
 PIPELINE_TRACE_SECTIONS = [
@@ -15,6 +43,7 @@ PIPELINE_TRACE_SECTIONS = [
     "preprocessing_high",
     "predictive_intent",
     "intent_extraction",
+    "schema_provenance",  # Phase 10 / audit §12.5
     "sql_generation",
     "sql_review",
     "sql_validation",
@@ -162,6 +191,11 @@ def build_pipeline_trace_template(request_metadata: dict[str, Any] | None = None
         debug_metadata={"request_id": (request_metadata or {}).get("request_id")},
     )
 
+    # Phase 10 / audit §12.5: ``schema_provenance`` carries the schema
+    # fingerprint used to ground the pipeline so we can detect ETL drift
+    # and so consumers can prove which schema produced the answer.
+    trace["schema_provenance"] = create_stage_section("schema_provenance")
+
     trace["overall_status"] = {
         "status": "pending",
         "final_route": "",
@@ -175,7 +209,95 @@ def build_pipeline_trace_template(request_metadata: dict[str, Any] | None = None
         "root_cause_detail": "",
         "analyst_recommended_fix": "",
     }
+    # Phase 10 / §12.3: every trace carries an explicit version.
+    trace["trace_version"] = TRACE_VERSION
     return trace
+
+
+def attach_schema_provenance(
+    trace: dict[str, Any],
+    *,
+    schema_fingerprint: str,
+    schema_source: str,
+    selected_table: str = "",
+    selected_columns: list[str] | None = None,
+    schema_loaded_at: Optional[str] = None,
+) -> None:
+    """Persist schema-provenance metadata onto the trace (audit §12.5)."""
+
+    payload = {
+        "schema_fingerprint": str(schema_fingerprint or ""),
+        "schema_source": str(schema_source or ""),
+        "selected_table": str(selected_table or ""),
+        "selected_columns": list(selected_columns or []),
+        "loaded_at": str(schema_loaded_at or utc_now_iso()),
+    }
+    set_stage_from_values(
+        trace.setdefault("schema_provenance", create_stage_section("schema_provenance")),
+        status="success" if schema_fingerprint else "skipped",
+        final_output=payload,
+        debug_metadata={"audit": "12.5"},
+    )
+
+
+def parse_trace_version(trace: dict[str, Any] | None) -> tuple[int, int]:
+    """Parse ``trace_version`` into a comparable tuple.
+
+    Unknown versions log a warning (Phase 10 / audit §12.3) and are treated
+    as ``(0, 0)`` so they never overwrite a known version.
+    """
+
+    raw = ""
+    if isinstance(trace, dict):
+        raw = str(trace.get("trace_version") or "").strip()
+    if not raw:
+        return (0, 0)
+    if raw not in KNOWN_TRACE_VERSIONS:
+        logger.warning(
+            "pipeline_trace.unknown_version",
+            extra={"trace_version": raw, "known": list(KNOWN_TRACE_VERSIONS)},
+        )
+        return (0, 0)
+    parts = raw.split(".")
+    try:
+        major = int(parts[0]) if parts else 0
+        minor = int(parts[1]) if len(parts) > 1 else 0
+        return (major, minor)
+    except (TypeError, ValueError):
+        return (0, 0)
+
+
+def select_trace_for_persistence(
+    *,
+    candidate: dict[str, Any] | None,
+    existing: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Pick the trace that should be persisted.
+
+    Phase 10 / §12.3: a candidate trace overwrites the existing trace ONLY
+    when its version is greater than or equal to the existing one. A
+    late-arriving response with an older version is rejected to prevent
+    silent regressions.
+    """
+
+    if not isinstance(candidate, dict):
+        return existing if isinstance(existing, dict) else None
+    if not isinstance(existing, dict):
+        return candidate
+
+    candidate_version = parse_trace_version(candidate)
+    existing_version = parse_trace_version(existing)
+    if candidate_version >= existing_version:
+        return candidate
+
+    logger.warning(
+        "pipeline_trace.older_overwrite_rejected",
+        extra={
+            "candidate_version": candidate.get("trace_version"),
+            "existing_version": existing.get("trace_version"),
+        },
+    )
+    return existing
 
 
 def attach_stage(trace: dict[str, Any], section_name: str, stage_payload: dict[str, Any]) -> None:
@@ -230,6 +352,9 @@ def finalize_trace(
         "root_cause_detail": str(root_cause_detail or ""),
         "analyst_recommended_fix": str(analyst_recommended_fix or ""),
     }
+    # Phase 10 / §12.3: ensure the version sticks even when callers
+    # finalize a trace they constructed manually.
+    trace.setdefault("trace_version", TRACE_VERSION)
     return trace
 
 

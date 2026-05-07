@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from bi_platform_shared.contracts.chart import ChartTypeEnum
+
 from intent_extraction.error_handler import IntentExtractionSchemaMismatchError
 from intent_extraction.schemas import StructuredIntent
 from shared.schema_utils import is_numeric_type, unqualify_table_name
@@ -10,6 +12,15 @@ from shared.schema_utils import is_numeric_type, unqualify_table_name
 _VALID_AGGREGATIONS = {"SUM", "AVG", "COUNT", "MIN", "MAX"}
 _VALID_FILTER_OPERATORS = {"=", "!=", ">", "<", ">=", "<=", "IN", "LIKE", "BETWEEN"}
 _NON_AGGREGATED_COMPARISON_INTENTS = {"comparison", "correlation", "relationship"}
+_PERCENTAGE_METRIC_TYPES = {"percentage", "percent", "ratio"}
+
+
+def _allowed_chart_values() -> set[str]:
+    """Phase 5 / CRIT-14: the chart taxonomy is sourced from
+    ``ChartTypeEnum`` so adding a new chart in the shared contract
+    automatically widens validation here without touching this module."""
+
+    return {member.value for member in ChartTypeEnum}
 
 
 def _resolve_table_name(
@@ -124,6 +135,65 @@ def _derive_primary_intent(operations: list[str]) -> str:
     if "filtering" in operations:
         return "filtering"
     return "projection"
+
+
+def _normalized_metric_type(intent: StructuredIntent) -> str:
+    direct = str(intent.get("metric_type", "")).strip().lower()
+    if direct in _PERCENTAGE_METRIC_TYPES:
+        return "percentage"
+    if direct in {"absolute", "count", "sum"}:
+        return "absolute"
+    chart_payload = intent.get("chart") if isinstance(intent.get("chart"), dict) else {}
+    chart_metric_type = str(chart_payload.get("metric_type", "")).strip().lower()
+    if chart_metric_type in _PERCENTAGE_METRIC_TYPES:
+        return "percentage"
+    if chart_metric_type in {"absolute", "count", "sum"}:
+        return "absolute"
+    return ""
+
+
+def _normalized_chart_contract(intent: StructuredIntent, dimensions: list[str], metric_type: str) -> dict[str, Any]:
+    chart_payload = intent.get("chart") if isinstance(intent.get("chart"), dict) else {}
+    chart_type = (
+        str(intent.get("selected_chart_type", "")).strip().lower()
+        or str(intent.get("chart_type", "")).strip().lower()
+        or str(chart_payload.get("type", "")).strip().lower()
+    )
+    group_by = str(chart_payload.get("group_by", "")).strip() or (dimensions[0] if dimensions else "")
+    if metric_type == "percentage" and not chart_type:
+        chart_type = "pie"
+    chart_metric_type = str(chart_payload.get("metric_type", "")).strip().lower() or metric_type
+    return {
+        "type": chart_type or None,
+        "metric_type": chart_metric_type or None,
+        "group_by": group_by or None,
+    }
+
+
+def _infer_semantic_flags(intent: StructuredIntent, metric_type: str) -> dict[str, bool]:
+    text_blob = " ".join(
+        [
+            str(intent.get("intent", "")).strip().lower(),
+            str(intent.get("intent_type", "")).strip().lower(),
+            str(metric_type or "").strip().lower(),
+            " ".join(str(op).strip().lower() for op in (intent.get("operations", []) or []) if str(op).strip()),
+        ]
+    )
+    is_percentage = metric_type == "percentage" or any(token in text_blob for token in ("percent", "percentage", "share", "ratio"))
+    is_distribution = "distribution" in text_blob or "histogram" in text_blob or "frequency" in text_blob or "spread" in text_blob
+    is_time_series = (
+        bool(intent.get("time_grouping_detected"))
+        or bool(intent.get("group_by_time"))
+        or bool(intent.get("is_time_series"))
+        or str(intent.get("time_granularity", "")).strip().lower() in {"hour", "day", "week", "month", "quarter", "year"}
+        or "time_series" in text_blob
+        or "trend" in text_blob
+    )
+    return {
+        "is_percentage": bool(is_percentage),
+        "is_distribution": bool(is_distribution),
+        "is_time_series": bool(is_time_series),
+    }
 
 
 def _supports_hour_column_type(col_type: str) -> bool:
@@ -319,6 +389,24 @@ def validate_structured_intent(
     normalized_limit = limit
 
     normalized_target = target_column or primary_metric
+    normalized_metric_type = _normalized_metric_type(intent)
+    chart_contract = _normalized_chart_contract(intent, dimensions, normalized_metric_type)
+    if not normalized_metric_type:
+        normalized_metric_type = str(chart_contract.get("metric_type") or "").strip().lower()
+    allowed_chart_values = _allowed_chart_values()
+    candidate_chart_type = (
+        str(intent.get("selected_chart_type", "")).strip().lower()
+        or str(intent.get("chart_type", "")).strip().lower()
+        or str(chart_contract.get("type") or "").strip().lower()
+    )
+    selected_chart_type = candidate_chart_type if candidate_chart_type in allowed_chart_values else ""
+    if not chart_contract.get("type") and selected_chart_type:
+        chart_contract["type"] = selected_chart_type
+    if normalized_metric_type == "percentage" and not selected_chart_type:
+        selected_chart_type = ChartTypeEnum.PIE.value
+        chart_contract["type"] = ChartTypeEnum.PIE.value
+    if normalized_metric_type and not chart_contract.get("metric_type"):
+        chart_contract["metric_type"] = normalized_metric_type
     time_granularity = str(intent.get("time_granularity", "")).strip().lower()
     time_column = str(intent.get("time_column", "")).strip()
     if time_granularity == "hour":
@@ -372,6 +460,52 @@ def validate_structured_intent(
         "requested": bool(ranking_direction or normalized_order_by),
         "source": ranking_payload.get("source", "validation"),
     }
+    semantic_flags = _infer_semantic_flags(intent, normalized_metric_type)
+    operation_set = {str(op).strip().lower() for op in operations if str(op).strip()}
+    relationship_semantic = "relationship" in operation_set or requested_intent in {"correlation", "relationship"}
+    if semantic_flags["is_distribution"] or "distribution" in operation_set:
+        selected_chart_type = ChartTypeEnum.HISTOGRAM.value
+        chart_contract["type"] = ChartTypeEnum.HISTOGRAM.value
+    elif semantic_flags["is_percentage"] and selected_chart_type == ChartTypeEnum.PIE.value:
+        chart_contract["type"] = ChartTypeEnum.PIE.value
+    elif semantic_flags["is_time_series"] and len(metrics) > 1:
+        selected_chart_type = ChartTypeEnum.LINE_MULTI.value
+        chart_contract["type"] = ChartTypeEnum.LINE_MULTI.value
+    elif semantic_flags["is_time_series"]:
+        selected_chart_type = ChartTypeEnum.LINE.value
+        chart_contract["type"] = ChartTypeEnum.LINE.value
+    elif relationship_semantic:
+        selected_chart_type = ChartTypeEnum.SCATTER.value
+        chart_contract["type"] = ChartTypeEnum.SCATTER.value
+    else:
+        selected_chart_type = selected_chart_type or (
+            ChartTypeEnum.PIE.value if semantic_flags["is_percentage"] else ""
+        )
+
+    chart_lock = bool(intent.get("chart_lock", False))
+    explicit_chart_lock = bool(intent.get("explicit_chart_lock", False))
+    if relationship_semantic or (
+        semantic_flags["is_time_series"] and len(metrics) > 1
+    ) or semantic_flags["is_percentage"] or semantic_flags["is_distribution"]:
+        chart_lock = True
+        explicit_chart_lock = True
+
+    x_axis = dimensions[0] if dimensions else ""
+    y_axis = [
+        metric.get("alias") or metric.get("column")
+        for metric in normalized_metric_specs
+        if isinstance(metric, dict) and (metric.get("alias") or metric.get("column"))
+    ]
+    if relationship_semantic and len(metrics) >= 2:
+        x_axis = metrics[0]
+        y_axis = [metrics[1]]
+    if semantic_flags["is_time_series"] and len(metrics) > 1:
+        x_axis = str(intent.get("time_dimension_alias") or "date")
+        y_axis = [
+            metric.get("alias") or metric.get("column")
+            for metric in normalized_metric_specs
+            if isinstance(metric, dict) and (metric.get("alias") or metric.get("column"))
+        ]
 
     return {
         "intent_type": intent["intent_type"],
@@ -388,8 +522,24 @@ def validate_structured_intent(
         "limit": normalized_limit,
         "time_granularity": time_granularity,
         "time_column": time_column,
-        "time_grouping_detected": bool(time_granularity in {"hour", "day", "week", "month", "year"}),
+        "time_grouping_detected": bool(
+            time_granularity in {"hour", "day", "week", "month", "quarter", "year"}
+            or intent.get("time_grouping_detected")
+            or intent.get("group_by_time")
+        ),
         "ranking": normalized_ranking,
         "operations": operations,
         "ambiguities": intent.get("ambiguities") if isinstance(intent.get("ambiguities"), list) else [],
+        "chart": chart_contract,
+        "metric_type": normalized_metric_type,
+        "selected_chart_type": selected_chart_type,
+        "chart_type": selected_chart_type,
+        "final_chart_type": selected_chart_type,
+        "chart_lock": chart_lock,
+        "explicit_chart_lock": explicit_chart_lock,
+        "chart_reason": str(intent.get("chart_reason", "")).strip(),
+        "chart_reason_code": str(intent.get("chart_reason_code", "")).strip() or "intent_validation_default",
+        "x_axis": x_axis,
+        "y_axis": y_axis,
+        **semantic_flags,
     }

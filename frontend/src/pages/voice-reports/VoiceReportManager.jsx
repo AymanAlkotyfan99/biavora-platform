@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from 'react'
 import { motion } from 'framer-motion'
-import { toast } from 'react-hot-toast'
+import { toast } from 'react-toastify'
 import { useSearchParams } from 'react-router-dom'
 import { 
   Mic, 
@@ -58,6 +58,14 @@ function VoiceReportManager() {
     return null
   }, [workspace, user])
 
+  const extractApiErrorMessage = (error, fallback = 'Processing failed') => {
+    const payload = error?.response?.data
+    if (typeof payload?.error === 'string' && payload.error.trim()) return payload.error.trim()
+    if (typeof payload?.message === 'string' && payload.message.trim()) return payload.message.trim()
+    if (typeof payload?.detail === 'string' && payload.detail.trim()) return payload.detail.trim()
+    return error?.message || fallback
+  }
+
   useEffect(() => {
     loadReports()
   }, [])
@@ -77,10 +85,39 @@ function VoiceReportManager() {
     const file = event.target.files[0]
     if (!file) return
 
-    // Validate file type
-    const validTypes = ['audio/wav', 'audio/mpeg', 'audio/mp3', 'audio/ogg', 'audio/webm']
-    if (!validTypes.includes(file.type)) {
-      toast.error('Please upload a valid audio file (WAV, MP3, OGG, WebM)')
+    // Validate file type (MIME OR extension fallback when MIME is empty/variant).
+    const normalizedType = String(file.type || '').toLowerCase()
+    const validTypes = [
+      'audio/wav',
+      'audio/x-wav',
+      'audio/wave',
+      'audio/vnd.wave',
+      'audio/x-pn-wav',
+      'audio/mpeg',
+      'audio/mp3',
+      'audio/mpga',
+      'audio/mp4',
+      'application/mp4',
+      'video/mp4',
+      'audio/m4a',
+      'audio/x-m4a',
+      'audio/ogg',
+      'application/ogg',
+      'audio/opus',
+      'audio/webm',
+      'video/webm',
+      'application/octet-stream',
+      '',
+    ]
+    const extension = String(file.name || '')
+      .toLowerCase()
+      .split('.')
+      .pop()
+    const validExtensions = ['wav', 'mp3', 'mp4', 'm4a', 'webm', 'ogg', 'mpga']
+    const extensionAllowed = validExtensions.includes(extension)
+    const mimeAllowed = validTypes.includes(normalizedType)
+    if (!mimeAllowed && !extensionAllowed) {
+      toast.error('Please upload a valid audio file (WAV, MP3, MP4, M4A, OGG, WebM)')
       return
     }
 
@@ -94,12 +131,96 @@ function VoiceReportManager() {
   }
 
   const isProcessingRequest = isUploading || isSubmittingText || isExecuting
+  const jobPollIntervalMs = 1000
+  const jobPollTimeoutMs = Number(import.meta.env.VITE_VOICE_JOB_TIMEOUT_MS || 600000) // 10 minutes
   const isPrimaryStepComplete = ['generating', 'executing', 'rendering'].includes(processingPhase)
   const isPrimaryStepActive = processingPhase === 'transcribing' || processingPhase === 'classifying'
   const formatConfidence = (value) => {
     const numeric = Number(value)
     if (!Number.isFinite(numeric)) return '-'
     return `${Math.round(Math.max(0, Math.min(1, numeric)) * 100)}%`
+  }
+
+  const pollJobStatus = async (jobId, reportId, sourceMode) => {
+    const startedAt = Date.now()
+    let attempts = 0
+    
+    toast.info(
+      sourceMode === 'voice'
+        ? 'Audio uploaded! Processing your request...'
+        : 'Text submitted! Processing your request...'
+    )
+
+    while (Date.now() - startedAt < jobPollTimeoutMs) {
+      try {
+        const statusResponse = await voiceReportsAPI.getJobStatus(jobId)
+        const { status, stage, progress_pct, error } = statusResponse.data
+
+        // Update progress
+        if (progress_pct > 0) {
+          setProcessingPhase(stage || status)
+        }
+
+        // Job completed successfully
+        if (status === 'COMPLETED') {
+          toast.success('Pipeline completed! Loading results...')
+          await loadReports()
+          const reportResponse = await voiceReportsAPI.getReport(reportId)
+          
+          if (reportResponse.data.success) {
+            const report = reportResponse.data.report
+            setCurrentReport({
+              id: report.id,
+              transcription: report.transcription,
+              sql: report.final_sql,
+              intent: report.intent_json,
+              status: report.status,
+              message: report.error_message || 'Success',
+              confidence: report.confidence,
+              degraded: report.degraded,
+              chart_type: report.chart_type,
+              embed_url: report.embed_url,
+              row_count: report.row_count,
+            })
+            toast.success(`Chart generated! ${report.row_count || 0} rows visualized`)
+          }
+          setSelectedFile(null)
+          setTextInput('')
+          setProcessingPhase(null)
+          return
+        }
+
+        // Job failed
+        if (status === 'FAILED') {
+          const errorMessage = error?.message || 'Pipeline failed. Please try again.'
+          toast.error(errorMessage)
+          setCurrentReport({
+            id: reportId,
+            status: 'failed',
+            message: errorMessage,
+          })
+          setSelectedFile(null)
+          setTextInput('')
+          setProcessingPhase(null)
+          await loadReports()
+          return
+        }
+
+        // Still processing, wait and retry
+        await new Promise(resolve => setTimeout(resolve, jobPollIntervalMs))
+        attempts++
+      } catch (error) {
+        console.error('Error polling job status:', error)
+        attempts++
+        await new Promise(resolve => setTimeout(resolve, jobPollIntervalMs))
+      }
+    }
+
+    // Timeout
+    const timeoutMinutes = Math.round(jobPollTimeoutMs / 60000)
+    toast.error(`Request timed out after ${timeoutMinutes} minute(s). The pipeline is still running in the background.`)
+    setProcessingPhase(null)
+    await loadReports()
   }
 
   const handleSubmissionResult = async (response, sourceMode) => {
@@ -112,120 +233,16 @@ function VoiceReportManager() {
       return
     }
 
+    const jobId = response.data.job_id
     const reportId = response.data.report_id || response.data.id
-    if (!reportId) {
-      toast.error('Request succeeded but no report ID was returned. Please try again.')
+    
+    if (!jobId || !reportId) {
+      toast.error('Request succeeded but no job ID was returned. Please try again.')
       return
     }
 
-    const questionType = String(response.data.question_type || '').trim().toLowerCase()
-    const nonAnalyticalTypes = new Set([
-      'conversational',
-      'informational',
-      'invalid_input',
-      'numeric_only_input',
-      'noise_input',
-      'empty_input',
-      'transcription_failure',
-      'no_speech_detected'
-    ])
-    const isExplicitNonAnalytical = nonAnalyticalTypes.has(questionType)
-    const hasSql = Boolean(response.data.sql && String(response.data.sql).trim())
-
-    if (isExplicitNonAnalytical) {
-      toast.success(
-        sourceMode === 'voice'
-          ? 'Audio transcribed! This appears to be a conversational question and does not require data analysis.'
-          : 'Text processed! This appears to be a conversational question and does not require data analysis.'
-      )
-      setCurrentReport({
-        id: reportId,
-        transcription: response.data.transcription,
-        sql: null,
-        intent: response.data.intent,
-        status: 'uploaded',
-        message: response.data.message,
-        confidence: response.data.confidence,
-        degraded: response.data.degraded,
-      })
-      setSelectedFile(null)
-      setTextInput('')
-      await loadReports()
-      return
-    }
-
-    if (!hasSql) {
-      const fallbackMessage =
-        response.data.message ||
-        response.data.error ||
-        'The request could not be processed into SQL. Please try rephrasing the question.'
-      toast.error(fallbackMessage)
-      setCurrentReport({
-        id: reportId,
-        transcription: response.data.transcription,
-        sql: null,
-        intent: response.data.intent,
-        status: response.data.status || 'failed',
-        message: fallbackMessage,
-        confidence: response.data.confidence,
-        degraded: response.data.degraded,
-      })
-      setSelectedFile(null)
-      setTextInput('')
-      await loadReports()
-      return
-    }
-
-    setProcessingPhase('generating')
-    toast.success(
-      sourceMode === 'voice'
-        ? 'Audio transcribed! Generating SQL query...'
-        : 'Text received! Generating SQL query...'
-    )
-
-    setProcessingPhase('executing')
-    const executeResponse = await voiceReportsAPI.executeQuery(reportId)
-
-    if (executeResponse.data.success) {
-      setProcessingPhase('rendering')
-      await new Promise(resolve => setTimeout(resolve, 500))
-
-      if (executeResponse.data.degraded) {
-        toast.success(`Chart generated with reduced confidence. ${executeResponse.data.row_count} rows visualized`)
-      } else {
-        toast.success(`Chart generated! ${executeResponse.data.row_count} rows visualized`)
-      }
-
-      setCurrentReport({
-        id: reportId,
-        transcription: response.data.transcription,
-        sql: response.data.sql,
-        intent: response.data.intent,
-        status: executeResponse.data.status || 'visualization_created',
-        embedUrl: executeResponse.data.embed_url,
-        rowCount: executeResponse.data.row_count,
-        executionTime: executeResponse.data.execution_time_ms,
-        chartType: executeResponse.data.chart_type,
-        confidence: executeResponse.data.confidence ?? response.data.confidence,
-        degraded: Boolean(executeResponse.data.degraded ?? response.data.degraded),
-      })
-
-      setSelectedFile(null)
-      setTextInput('')
-      await loadReports()
-      return
-    }
-
-    toast.error(executeResponse.data.error || 'Chart generation failed')
-    setCurrentReport({
-      id: reportId,
-      transcription: response.data.transcription,
-        sql: response.data.sql,
-        intent: response.data.intent,
-        status: 'failed',
-        confidence: response.data.confidence,
-        degraded: response.data.degraded,
-      })
+    // Start polling for job status
+    await pollJobStatus(jobId, reportId, sourceMode)
   }
 
   const handleUpload = async () => {
@@ -247,8 +264,9 @@ function VoiceReportManager() {
       await handleSubmissionResult(response, 'voice')
     } catch (error) {
       console.error('Processing error:', error)
-      const errorMessage = error.response?.data?.error || error.message || 'Processing failed'
-      toast.error(`Error: ${errorMessage}`)
+      const errorMessage = extractApiErrorMessage(error, 'Processing failed')
+      const errorCode = String(error.response?.data?.error_code || '').trim()
+      toast.error(`Error: ${errorMessage}${errorCode ? ` (${errorCode})` : ''}`)
       if (
         error.response?.status === 403 &&
         String(error.response?.data?.message || error.response?.data?.error || '')
@@ -280,7 +298,7 @@ function VoiceReportManager() {
       await handleSubmissionResult(response, 'text')
     } catch (error) {
       console.error('Text processing error:', error)
-      const errorMessage = error.response?.data?.error || error.message || 'Processing failed'
+      const errorMessage = extractApiErrorMessage(error, 'Processing failed')
       toast.error(`Error: ${errorMessage}`)
       if (
         error.response?.status === 403 &&
@@ -332,9 +350,14 @@ function VoiceReportManager() {
           intent: report.intent,
           status: report.status,
           embedUrl: report.embed_url,
+          metabaseQuestionId: report.metabase_question_id,
           rowCount: report.row_count,
           executionTime: report.execution_time_ms,
-          chartType: report.chart_type,
+          chartType: report.final_chart_type || report.chart_type,
+          finalChartType: report.final_chart_type || report.chart_type,
+          selectedChartType: report.selected_chart_type,
+          metabaseDisplay: report.metabase_display,
+          visualizationStatus: report.visualization_status || 'success',
           confidence: report.confidence,
           degraded: report.degraded,
         })
@@ -638,7 +661,7 @@ function VoiceReportManager() {
                         <span className="text-sm font-medium">Chart Type</span>
                       </div>
                       <p className="text-2xl font-bold text-gray-900 dark:text-white capitalize">
-                        {currentReport.chartType}
+                        {currentReport.finalChartType || currentReport.chartType}
                       </p>
                     </div>
 
@@ -659,10 +682,17 @@ function VoiceReportManager() {
                   </div>
 
                   {/* Embedded Visualization */}
+                  {(currentReport.visualizationStatus === 'partial_success' ||
+                    (currentReport.finalChartType && currentReport.metabaseDisplay && currentReport.finalChartType !== currentReport.metabaseDisplay)) && (
+                    <div className="mb-4 p-3 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded-lg text-sm text-yellow-800 dark:text-yellow-300">
+                      Visualization warning: chart metadata and rendered display are out of sync.
+                    </div>
+                  )}
                   {currentReport.embedUrl && (
                     <div className="mb-4">
                       <div className="border-2 border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden shadow-lg">
                         <iframe
+                          key={`${currentReport.metabaseQuestionId || currentReport.id}-${currentReport.finalChartType || currentReport.chartType}-${currentReport.embedUrl}-${currentReport.updatedAt || ''}`}
                           src={currentReport.embedUrl}
                           width="100%"
                           height="600"
@@ -826,6 +856,3 @@ function VoiceReportManager() {
 }
 
 export default VoiceReportManager
-
-
-

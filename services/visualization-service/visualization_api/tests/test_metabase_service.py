@@ -21,321 +21,223 @@ class _FakeResponse:
         return self._payload
 
 
-def _build_service_with_capture():
+def _service():
     service = MetabaseService()
     service._request = MagicMock(return_value=_FakeResponse({"id": 123}))
     return service
 
 
-def test_scatter_payload_uses_scatter_display_and_graph_axes():
-    service = _build_service_with_capture()
+def _payload(service):
+    return service._request.call_args.kwargs["json"]
 
+
+def test_valid_explicit_chart_is_preserved():
+    service = _service()
     result = service.create_question(
-        name="scatter q",
-        sql="SELECT x, y FROM t",
-        visualization_settings={"display": "scatter", "numeric_columns": ["x", "y"]},
+        name="line",
+        sql="SELECT day_key, value FROM t",
+        visualization_settings={
+            "chart_config": {
+                "selected_chart_type": "line",
+                "explicit_chart_lock": True,
+                "x_axis": "day_key",
+                "y_axis": ["value"],
+            },
+            "graph": {"type": "line", "dimensions": ["day_key"], "metrics": ["value"]},
+            "result_rows": [{"day_key": "2026-01-01", "value": 10}],
+            "dataset_columns": [{"name": "day_key"}, {"name": "value"}],
+        },
     )
-
     assert result == 123
-    payload = service._request.call_args.kwargs["json"]
-    assert payload["display"] == "scatter"
-    assert payload["visualization_settings"]["graph.dimensions"] == ["x"]
-    assert payload["visualization_settings"]["graph.metrics"] == ["y"]
-
-
-def test_line_payload_stays_line():
-    service = _build_service_with_capture()
-
-    result = service.create_question(
-        name="line q",
-        sql="SELECT d, v FROM t",
-        visualization_settings={"display": "line"},
-    )
-
-    assert result == 123
-    payload = service._request.call_args.kwargs["json"]
+    payload = _payload(service)
     assert payload["display"] == "line"
-    assert payload["visualization_settings"]["display"] == "line"
+    assert payload["visualization_settings"]["final_chart_type"] == "line"
+    assert payload["visualization_settings"]["overwritten_by"] == ""
 
 
-def test_bar_payload_stays_bar():
-    service = _build_service_with_capture()
-
+def test_percentage_pie_contract_is_preserved():
+    service = _service()
     result = service.create_question(
-        name="bar q",
-        sql="SELECT c, v FROM t",
-        visualization_settings={"display": "bar"},
-    )
-
-    assert result == 123
-    payload = service._request.call_args.kwargs["json"]
-    assert payload["display"] == "bar"
-
-
-def test_card_payload_stays_scalar():
-    service = _build_service_with_capture()
-
-    result = service.create_question(
-        name="card q",
-        sql="SELECT COUNT(*) AS v FROM t",
-        visualization_settings={"display": "scalar"},
-    )
-
-    assert result == 123
-    payload = service._request.call_args.kwargs["json"]
-    assert payload["display"] == "scalar"
-
-
-def test_line_payload_includes_time_dimension_and_metric():
-    service = _build_service_with_capture()
-
-    result = service.create_question(
-        name="line q with metadata",
-        sql="SELECT period, total_sales FROM t",
+        name="pie",
+        sql="SELECT period, percentage_share FROM t",
         visualization_settings={
-            "display": "line",
-            "time_columns": ["period"],
-            "numeric_columns": ["total_sales"],
+            "chart_config": {
+                "selected_chart_type": "pie",
+                "explicit_chart_lock": True,
+                "chart_reason_code": "percentage_distribution",
+                "x_axis": "period",
+                "y_axis": ["percentage_share"],
+            },
+            "metric_type": "percentage",
+            "result_rows": [{"period": "2026-01", "percentage_share": 0.4}],
+            "dataset_columns": [{"name": "period"}, {"name": "percentage_share"}],
         },
     )
-
     assert result == 123
-    payload = service._request.call_args.kwargs["json"]
+    payload = _payload(service)
+    assert payload["display"] == "pie"
+    assert payload["visualization_settings"]["final_chart_type"] == "pie"
+    assert payload["visualization_settings"]["chart_decision_trace"]["overwritten"] is False
+
+
+def test_time_series_line_contract_is_renderer_only():
+    service = _service()
+    result = service.create_question(
+        name="line",
+        sql="SELECT ds, metric FROM t",
+        visualization_settings={
+            "chart_config": {"selected_chart_type": "line", "explicit_chart_lock": True, "x_axis": "ds", "y_axis": ["metric"]},
+            "graph": {"type": "line", "dimensions": ["ds"], "metrics": ["metric"]},
+            "result_rows": [{"ds": "2026-01-01", "metric": 1}],
+            "dataset_columns": [{"name": "ds"}, {"name": "metric"}],
+        },
+    )
+    assert result == 123
+    payload = _payload(service)
     assert payload["display"] == "line"
-    assert payload["visualization_settings"]["graph.dimensions"] == ["period"]
-    assert payload["visualization_settings"]["graph.metrics"] == ["total_sales"]
+    assert payload["visualization_settings"]["final_chart_type"] == "line"
 
 
-def test_histogram_payload_uses_numeric_metric():
-    service = _build_service_with_capture()
-
+def test_multi_series_maps_to_metabase_line_and_preserves_metadata():
+    service = _service()
     result = service.create_question(
-        name="hist q",
-        sql="SELECT orders FROM t",
-        visualization_settings={"display": "histogram", "numeric_columns": ["orders"]},
-    )
-
-    assert result == 123
-    payload = service._request.call_args.kwargs["json"]
-    assert payload["display"] == "histogram"
-    assert payload["visualization_settings"]["graph.metrics"] == ["orders"]
-
-
-def test_histogram_payload_uses_customers_metric():
-    service = _build_service_with_capture()
-
-    result = service.create_question(
-        name="hist customers",
-        sql="SELECT customers FROM t",
-        visualization_settings={"display": "histogram", "numeric_columns": ["customers"]},
-    )
-
-    assert result == 123
-    payload = service._request.call_args.kwargs["json"]
-    assert payload["display"] == "histogram"
-    assert payload["visualization_settings"]["graph.metrics"] == ["customers"]
-
-
-def test_histogram_metric_priority_prefers_numeric_columns_over_axis_hints():
-    service = _build_service_with_capture()
-
-    result = service.create_question(
-        name="hist numeric priority",
-        sql="SELECT total_sales FROM t",
+        name="multi",
+        sql="SELECT ds, m1, m2 FROM t",
         visualization_settings={
-            "display": "histogram",
-            "x_column": "total_sales",
-            "numeric_columns": ["orders"],
+            "chart_config": {"selected_chart_type": "line_multi", "x_axis": "ds", "y_axis": ["m1", "m2"]},
+            "graph": {"type": "line", "dimensions": ["ds"], "metrics": ["m1", "m2"]},
+            "result_rows": [{"ds": "2026-01-01", "m1": 1, "m2": 2}],
+            "dataset_columns": [{"name": "ds"}, {"name": "m1"}, {"name": "m2"}],
         },
     )
-
     assert result == 123
-    payload = service._request.call_args.kwargs["json"]
-    assert payload["display"] == "histogram"
-    assert payload["visualization_settings"]["graph.metrics"] == ["orders"]
+    payload = _payload(service)
+    assert payload["display"] == "line"
+    assert payload["visualization_settings"]["final_chart_type"] == "line_multi"
 
 
-def test_histogram_metric_uses_dataset_numeric_column_when_numeric_columns_missing():
-    service = _build_service_with_capture()
-
+def test_multi_series_requires_explicit_metrics_and_dimensions():
+    service = _service()
     result = service.create_question(
-        name="hist dataset numeric",
-        sql="SELECT region, amount FROM t",
+        name="multi-missing",
+        sql="SELECT ds, m1, m2 FROM t",
         visualization_settings={
-            "display": "histogram",
-            "columns": [
-                {"name": "region", "type": "String"},
-                {"name": "amount", "type": "Float64"},
-            ],
+            "chart_config": {"selected_chart_type": "line_multi"},
+            "graph": {"type": "line", "dimensions": ["ds"], "metrics": []},
+            "result_rows": [{"ds": "2026-01-01", "m1": 1, "m2": 2}],
+            "dataset_columns": [{"name": "ds"}, {"name": "m1"}, {"name": "m2"}],
         },
     )
-
-    assert result == 123
-    payload = service._request.call_args.kwargs["json"]
-    assert payload["display"] == "histogram"
-    assert payload["visualization_settings"]["graph.metrics"] == ["amount"]
+    assert result is None
+    assert "missing_required_axis_bindings:line_multi" in (service.last_error or "")
 
 
-def test_histogram_metric_falls_back_to_first_dataset_column():
-    service = _build_service_with_capture()
-
+def test_invalid_explicit_pie_fails_without_axis_bindings():
+    service = _service()
     result = service.create_question(
-        name="hist dataset first column fallback",
-        sql="SELECT category FROM t",
+        name="invalid pie",
+        sql="SELECT value FROM t",
         visualization_settings={
-            "display": "histogram",
-            "columns": [
-                {"name": "category", "type": "String"},
-            ],
+            "chart_config": {"selected_chart_type": "pie", "explicit_chart_lock": True},
+            "result_rows": [{"value": 1}, {"value": 2}],
+            "dataset_columns": [{"name": "value"}],
         },
     )
-
-    assert result == 123
-    payload = service._request.call_args.kwargs["json"]
-    assert payload["display"] == "histogram"
-    assert payload["visualization_settings"]["graph.metrics"] == ["category"]
+    assert result is None
+    assert "missing_required_label_value_bindings:pie" in (service.last_error or "")
 
 
-def test_histogram_metric_uses_numeric_column_in_result_rows():
-    service = _build_service_with_capture()
-
+def test_missing_contract_errors_instead_of_inferring_table():
+    service = _service()
     result = service.create_question(
-        name="hist result rows numeric",
-        sql="SELECT region, orders FROM t",
-        visualization_settings={
-            "display": "histogram",
-            "dataset_columns": [
-                {"name": "region", "type": "String"},
-                {"name": "orders", "type": ""},
-            ],
-            "result_rows": [
-                {"region": "north", "orders": 12},
-                {"region": "south", "orders": 23},
-            ],
-        },
-    )
-
-    assert result == 123
-    payload = service._request.call_args.kwargs["json"]
-    assert payload["display"] == "histogram"
-    assert payload["visualization_settings"]["graph.metrics"] == ["orders"]
-
-
-def test_histogram_without_metric_context_falls_back_safely():
-    service = _build_service_with_capture()
-
-    result = service.create_question(
-        name="hist invalid",
+        name="no contract",
         sql="SELECT a FROM t",
-        visualization_settings={"display": "histogram"},
+        visualization_settings={"result_rows": [{"a": "x"}], "dataset_columns": [{"name": "a"}]},
     )
-
-    assert result == 123
-    payload = service._request.call_args.kwargs["json"]
-    assert payload["display"] == "table"
-    assert payload["visualization_settings"]["display"] == "table"
-    assert payload["visualization_settings"]["fallback_applied"] is True
-    assert payload["visualization_settings"]["fallback_reason"] == "invalid_histogram_shape"
+    assert result is None
+    assert "missing_upstream_chart_contract" in (service.last_error or "")
 
 
-def test_invalid_scatter_records_truthful_table_fallback_when_shape_unknown():
-    service = _build_service_with_capture()
-
+def test_scatter_chart_binds_graph_axes_explicitly():
+    service = _service()
     result = service.create_question(
-        name="scatter invalid",
-        sql="SELECT region, sales FROM t",
-        visualization_settings={"display": "scatter"},
-    )
-
-    assert result == 123
-    payload = service._request.call_args.kwargs["json"]
-    assert payload["display"] == "table"
-    assert payload["visualization_settings"]["fallback_applied"] is True
-    assert payload["visualization_settings"]["fallback_reason"] == "invalid_scatter_shape"
-
-
-def test_missing_display_uses_shape_to_choose_line_not_table_for_time_series():
-    service = _build_service_with_capture()
-
-    result = service.create_question(
-        name="shape line",
-        sql="SELECT period, total_sales FROM t",
+        name="scatter",
+        sql="SELECT total_sales, orders FROM t",
         visualization_settings={
-            "time_columns": ["period"],
-            "numeric_columns": ["total_sales"],
-            "row_count": 10,
+            "chart_config": {
+                "selected_chart_type": "scatter",
+                "x_axis": "total_sales",
+                "y_axis": ["orders"],
+                "explicit_chart_lock": True,
+            },
+            "result_rows": [{"total_sales": 100.0, "orders": 10}],
+            "dataset_columns": [
+                {"name": "total_sales", "type": "Float64", "is_numeric": True},
+                {"name": "orders", "type": "Int64", "is_numeric": True},
+            ],
         },
     )
-
     assert result == 123
-    payload = service._request.call_args.kwargs["json"]
-    assert payload["display"] == "line"
-    assert payload["visualization_settings"]["fallback_applied"] is True
-    assert payload["visualization_settings"]["fallback_reason"] == "missing_requested_display"
-
-
-def test_missing_display_shape_rules_cover_scatter_bar_and_scalar():
-    cases = [
-        (
-            {
-                "numeric_columns": ["customers", "sales"],
-                "row_count": 10,
-            },
-            "scatter",
-            ["customers"],
-            ["sales"],
-        ),
-        (
-            {
-                "category_columns": ["region"],
-                "numeric_columns": ["sales"],
-                "row_count": 2,
-            },
-            "bar",
-            ["region"],
-            ["sales"],
-        ),
-        (
-            {
-                "numeric_columns": ["sales"],
-                "row_count": 1,
-            },
-            "scalar",
-            None,
-            ["sales"],
-        ),
-    ]
-    for settings, expected_display, expected_dimensions, expected_metrics in cases:
-        service = _build_service_with_capture()
-        result = service.create_question(
-            name=f"shape {expected_display}",
-            sql="SELECT * FROM t",
-            visualization_settings=settings,
-        )
-
-        assert result == 123
-        payload = service._request.call_args.kwargs["json"]
-        assert payload["display"] == expected_display
-        if expected_dimensions is not None:
-            assert payload["visualization_settings"]["graph.dimensions"] == expected_dimensions
-        assert payload["visualization_settings"]["graph.metrics"] == expected_metrics
-        assert payload["visualization_settings"]["fallback_reason"] == "missing_requested_display"
-
-
-def test_valid_scatter_never_silently_defaults_to_table():
-    service = _build_service_with_capture()
-
-    result = service.create_question(
-        name="valid scatter",
-        sql="SELECT customers, total_sales FROM t",
-        visualization_settings={
-            "display": "scatter",
-            "numeric_columns": ["customers", "total_sales"],
-            "row_count": 10,
-        },
-    )
-
-    assert result == 123
-    payload = service._request.call_args.kwargs["json"]
+    payload = _payload(service)
     assert payload["display"] == "scatter"
-    assert payload["visualization_settings"]["fallback_applied"] is False
+    assert payload["visualization_settings"]["final_chart_type"] == "scatter"
+    assert payload["visualization_settings"]["graph.dimensions"] == ["total_sales"]
+    assert payload["visualization_settings"]["graph.metrics"] == ["orders"]
+
+
+def test_scatter_without_axes_returns_prepare_error():
+    service = _service()
+    result = service.create_question(
+        name="scatter-missing-axes",
+        sql="SELECT city, orders FROM t",
+        visualization_settings={
+            "chart_config": {"selected_chart_type": "scatter", "explicit_chart_lock": True},
+            "result_rows": [{"city": "A", "orders": 10}],
+            "dataset_columns": [{"name": "city"}, {"name": "orders", "type": "Int64", "is_numeric": True}],
+        },
+    )
+    assert result is None
+    assert service.last_error == "missing_required_axis_bindings:scatter"
+
+
+def test_metabase_payload_sql_is_sanitized_for_trailing_semicolons():
+    service = _service()
+    result = service.create_question(
+        name="semicolon",
+        sql=" SELECT total_sales, orders FROM etl.sales_3months_realistic_csv;;  ",
+        visualization_settings={
+            "chart_config": {"selected_chart_type": "scatter", "x_axis": "total_sales", "y_axis": ["orders"]},
+            "result_rows": [{"total_sales": 100.0, "orders": 10}],
+            "dataset_columns": [
+                {"name": "total_sales", "type": "Float64", "is_numeric": True},
+                {"name": "orders", "type": "Int64", "is_numeric": True},
+            ],
+        },
+    )
+    assert result == 123
+    payload = _payload(service)
+    assert payload["dataset_query"]["native"]["query"] == "SELECT total_sales, orders FROM etl.sales_3months_realistic_csv"
+
+
+def test_metabase_payload_sql_strips_ch_settings_comment_prefix():
+    service = _service()
+    result = service.create_question(
+        name="comment-prefix",
+        sql="/* ch_settings: max_execution_time=60, max_result_rows=100000, readonly=2 */\nSELECT total_sales, orders FROM etl.sales_3months_realistic_csv;",
+        visualization_settings={
+            "chart_config": {
+                "selected_chart_type": "scatter",
+                "x_axis": "total_sales",
+                "y_axis": ["orders"],
+                "explicit_chart_lock": True,
+            },
+            "result_rows": [{"total_sales": 100.0, "orders": 10}],
+            "dataset_columns": [
+                {"name": "total_sales", "type": "Float64", "is_numeric": True},
+                {"name": "orders", "type": "Int64", "is_numeric": True},
+            ],
+        },
+    )
+    assert result == 123
+    payload = _payload(service)
+    assert payload["dataset_query"]["native"]["query"] == "SELECT total_sales, orders FROM etl.sales_3months_realistic_csv"

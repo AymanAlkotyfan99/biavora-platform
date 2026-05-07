@@ -18,9 +18,13 @@ requests==2.31.0
 
 # ClickHouse HTTP Client (for query execution)
 clickhouse-connect
+sqlglot>=25.17.0
 
 # Python dotenv for environment variables
 python-dotenv==1.0.0
+
+# Data validation for shared chart contracts
+pydantic>=2.5,<3.0
 
 # Testing
 pytest==7.4.3

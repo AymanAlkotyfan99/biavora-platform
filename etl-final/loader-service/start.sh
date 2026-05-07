@@ -14,23 +14,18 @@ import time
 sys.path.insert(0, '/app/loader-service/loader')
 sys.path.insert(0, '/app')
 
-max_retries = 10
-retry_count = 0
+attempt = 1
 
-while retry_count < max_retries:
+while True:
     try:
-        print(f'[LOADER] Attempting to start listener (attempt {retry_count + 1}/{max_retries})...')
+        print(f'[LOADER] Starting listener (attempt {attempt})...')
         from engine.kafka_listener import start_listener
         start_listener()
-        break
+        print('[LOADER] Listener stopped unexpectedly. Restarting in 10 seconds...')
     except Exception as e:
         print(f'[LOADER ERROR] Failed to connect: {e}')
-        retry_count += 1
-        if retry_count < max_retries:
-            print(f'[LOADER] Retrying in 10 seconds...')
-            time.sleep(10)
-        else:
-            print(f'[LOADER] Max retries reached. Exiting.')
-            sys.exit(1)
+    attempt += 1
+    print('[LOADER] Retrying in 10 seconds...')
+    time.sleep(10)
 "
 

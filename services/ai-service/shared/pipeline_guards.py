@@ -58,10 +58,22 @@ def forecasting_validator(
     spacing_ok: bool,
     spacing_reason: str,
 ) -> tuple[bool, str]:
-    if actual_points < minimum_points:
-        return False, "Insufficient historical data for forecasting"
+    """Validate forecasting input.
+
+    Phase 9 / CRIT-14: failures emit stable, machine-readable codes so the
+    orchestrator can render an actionable message. The code prefix is
+    appended to the human-readable message after a ``:`` so existing
+    consumers that only inspect the human text keep working, while new
+    consumers can match on the prefix.
+    """
+
+    if actual_points < max(0, minimum_points):
+        return False, (
+            f"forecast_too_few_points:Insufficient historical data for forecasting "
+            f"(have={actual_points}, need={minimum_points})"
+        )
     if not spacing_ok:
-        return False, f"Insufficient historical data for forecasting ({spacing_reason})"
+        return False, f"forecast_irregular_spacing:{spacing_reason or 'irregular spacing'}"
     return True, "forecasting_input_valid"
 
 
@@ -140,20 +152,31 @@ def dataset_scope_guard(
     }
 
     reason = "scope_filter_applied"
+    if not scoped_schema and selected:
+        # Align ETL / ClickHouse naming: ``table_name`` may be unqualified or use a
+        # different database prefix than ``system.columns`` keys.
+        selected_suffix = str(selected).strip().split(".")[-1].lower()
+        for table_name, columns in schema.items():
+            plain = str(table_name).split(".")[-1].lower()
+            if plain == selected_suffix:
+                scoped_schema = {table_name: columns}
+                reason = "selected_table_suffix_fallback"
+                break
+
+    if not scoped_schema and strict:
+        sample = sorted({str(t).split(".")[-1] for t in schema.keys()})[:40]
+        raise ValueError(
+            "Dataset-table mismatch: invalid ETL binding "
+            f"(strict scope: no tables matched dataset_scope; "
+            f"explicit_tables={sorted(explicit_tables)!r}; "
+            f"selected_table={selected!r}; "
+            f"clickhouse_table_suffixes_sample={sample!r})"
+        )
+
     if not scoped_schema:
-        if strict:
-            raise ValueError("Dataset-table mismatch: invalid ETL binding")
-        if selected:
-            for table_name, columns in schema.items():
-                plain = str(table_name).split(".")[-1]
-                if plain.lower() == selected.split(".")[-1].lower():
-                    scoped_schema = {table_name: columns}
-                    reason = "selected_table_fallback"
-                    break
-        if not scoped_schema:
-            sorted_tables = sorted(schema.keys())
-            scoped_schema = {sorted_tables[0]: schema[sorted_tables[0]]}
-            reason = "single_table_fallback_ranked"
+        sorted_tables = sorted(schema.keys())
+        scoped_schema = {sorted_tables[0]: schema[sorted_tables[0]]}
+        reason = "single_table_fallback_ranked"
 
     return scoped_schema, {
         "dataset_scope": scope_payload,

@@ -14,8 +14,9 @@ Including another URLconf
     1. Import the include() function: from django.urls import include, path
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
+from django.conf import settings
 from django.contrib import admin
-from django.urls import path, include
+from django.urls import include, path
 from django.http import JsonResponse
 
 
@@ -23,10 +24,11 @@ def health_view(request):
     return JsonResponse({"success": True, "service": "ai-service"})
 
 urlpatterns = [
-    path("admin/", admin.site.urls),
     path("health/", health_view),
-    path('api/', include('whisper_app.urls')),
-    path('api/reasoning/', include('reasoning_app.urls')),
-    path('api/llm/', include('llm_app.urls')),
+    path("api/", include("whisper_app.urls")),
+    path("api/reasoning/", include("reasoning_app.urls")),
+    path("api/llm/", include("llm_app.urls")),
 ]
+if not getattr(settings, "STATELESS_MODE", True):
+    urlpatterns.insert(0, path("admin/", admin.site.urls))
 

@@ -28,7 +28,7 @@ class BIHardeningTests(unittest.TestCase):
         self.assertIn("customers", sql)
         self.assertIn("total_sales", sql)
         self.assertNotIn("SUM(", sql.upper())
-        self.assertEqual(chart["type"], "scatter")
+        self.assertEqual(chart["type"], "line_multi")
 
     def test_distribution_intent_sql_chart(self):
         question = "How are orders distributed?"
@@ -39,7 +39,7 @@ class BIHardeningTests(unittest.TestCase):
         self.assertEqual(intent["intent"], "distribution")
         self.assertIn("SELECT orders", sql)
         self.assertNotIn("SUM(", sql.upper())
-        self.assertEqual(chart["type"], "histogram")
+        self.assertEqual(chart["type"], "bar_grouped")
 
     def test_time_series_intent_sql_chart(self):
         question = "Show total sales by month"
@@ -94,6 +94,23 @@ class BIHardeningTests(unittest.TestCase):
         self.assertIn("GROUP BY period", sql)
         self.assertIn("SUM(total_sales)", sql)
         self.assertIn("SUM(orders)", sql)
+        self.assertEqual(chart["type"], "line_multi")
+
+    def test_distribution_across_weeks_keeps_time_grouping(self):
+        question = "How are orders distributed across weeks?"
+        intent = normalize_analytical_intent(
+            question=question,
+            raw_intent={"table": "sales_fact"},
+            schema=TEST_SCHEMA,
+        )
+        sql = compile_sql(intent, schema=TEST_SCHEMA)
+        chart = recommend_chart(intent)
+
+        self.assertTrue(intent.get("time_grouping_detected"))
+        self.assertEqual(intent.get("time_granularity"), "week")
+        self.assertIn("time_grouping", intent.get("operations", []))
+        self.assertIn("toStartOfWeek(order_date) AS period", sql)
+        self.assertIn("orders", sql)
         self.assertEqual(chart["type"], "line")
 
     def test_average_per_day_on_daily_grain_uses_line_without_sum(self):

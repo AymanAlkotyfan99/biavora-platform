@@ -5,6 +5,13 @@ from typing import Any
 
 import requests
 
+try:  # pragma: no cover
+    from bi_platform_shared.http import HttpClientError, get_default_client
+    _SHARED_CLIENT_AVAILABLE = True
+except Exception:  # pragma: no cover
+    HttpClientError = Exception  # type: ignore[assignment,misc]
+    _SHARED_CLIENT_AVAILABLE = False
+
 
 class ForecastingBridgeError(Exception):
     def __init__(self, code: str, message: str, *, details: dict[str, Any] | None = None) -> None:
@@ -38,13 +45,28 @@ def _headers() -> dict[str, str]:
 
 def _post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     url = f"{_ai_service_base_url()}{path}"
+    timeout_s = _request_timeout_seconds()
     try:
-        response = requests.post(
-            url,
-            json=payload,
-            headers=_headers(),
-            timeout=_request_timeout_seconds(),
-        )
+        if _SHARED_CLIENT_AVAILABLE:
+            response = get_default_client().post(
+                url,
+                json=payload,
+                headers=_headers(),
+                timeout=(min(5.0, float(timeout_s)), float(timeout_s)),
+                attach_internal_api_key=False,
+            )
+        else:
+            response = requests.post(
+                url,
+                json=payload,
+                headers=_headers(),
+                timeout=timeout_s,
+            )
+    except HttpClientError as exc:  # type: ignore[misc]
+        raise ForecastingBridgeError(
+            "forecasting_bridge_request_failed",
+            f"AI-service forecasting request failed: {exc}",
+        ) from exc
     except requests.RequestException as exc:
         raise ForecastingBridgeError(
             "forecasting_bridge_request_failed",

@@ -12,7 +12,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/requirements.txt
+COPY services/ai-service/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --progress-bar off --upgrade pip "setuptools<81" wheel
 # Install a stable CPU-only torch build (2.10.0+cpu is currently failing with invalid wheel/hash mismatch).
 RUN pip install --no-cache-dir --progress-bar off \
@@ -20,7 +20,11 @@ RUN pip install --no-cache-dir --progress-bar off \
     "torch==2.9.0+cpu"
 RUN pip install --no-cache-dir --progress-bar off -r /app/requirements.txt
 
-COPY . /app
+COPY services/ai-service /app
+# CRIT-03/CRIT-04/CRIT-11 shared contracts package (Pydantic v2 contracts,
+# audio validation, predictive detector, HTTP client). Required at runtime
+# by ``shared.sql_review`` and ``whisper_app.transcription_task``.
+COPY bi_platform_shared /app/bi_platform_shared
 
 EXPOSE 8005
 

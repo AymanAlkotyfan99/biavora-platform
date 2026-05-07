@@ -34,6 +34,7 @@ def _build_request_config(
     workspace_id: Optional[str] = None,
     report_id: Optional[str] = None,
     table_name: Optional[str] = None,
+    access_token: Optional[str] = None,
 ) -> dict[str, Any]:
     return {
         "ops": {
@@ -51,6 +52,7 @@ def _build_request_config(
                     "workspace_id": workspace_id,
                     "report_id": report_id,
                     "table_name": table_name,
+                    "access_token": access_token,
                 }
             }
         }
@@ -292,6 +294,7 @@ def run_full_ai_pipeline(
     workspace_id: Optional[str] = None,
     report_id: Optional[str] = None,
     table_name: Optional[str] = None,
+    access_token: Optional[str] = None,
 ) -> dict[str, Any]:
     run_config = _build_request_config(
         audio_path=audio_path,
@@ -306,6 +309,7 @@ def run_full_ai_pipeline(
         workspace_id=workspace_id,
         report_id=report_id,
         table_name=table_name,
+        access_token=access_token,
     )
     result = _execute_job("ai_service_pipeline_job", run_config=run_config)
     runtime = _extract_dagster_runtime(result, job_name="ai_service_pipeline_job")

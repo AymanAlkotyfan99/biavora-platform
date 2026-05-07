@@ -475,6 +475,49 @@ def _chart_series_config(*, include_forecast: bool) -> list[dict[str, Any]]:
     return [dict(FORECAST_SERIES_CONFIG[key]) for key in keys]
 
 
+def _sort_series_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    series_order = {"actual": 0, "forecast": 1}
+
+    def sort_key(row: dict[str, Any]) -> tuple[datetime, int]:
+        parsed = _parse_datetime(row.get("ds"))
+        if parsed is None:
+            parsed = datetime.max
+        row_series = str(row.get("series_type", "")).strip().lower()
+        return parsed, series_order.get(row_series, 9)
+
+    return sorted([row for row in rows if isinstance(row, dict)], key=sort_key)
+
+
+def _validate_forecast_points(
+    *,
+    ordered: list[tuple[datetime, float]],
+    forecast_points: list[tuple[datetime, float]],
+    resolved_horizon: int,
+    granularity: str,
+) -> str:
+    if len(forecast_points) != resolved_horizon:
+        return f"forecast_horizon_mismatch:expected={resolved_horizon},actual={len(forecast_points)}"
+    if not ordered or not forecast_points:
+        return "forecast_points_missing"
+
+    expected_start = ordered[-1][0] + timedelta(days=1)
+    if granularity == "day" and forecast_points[0][0].date() != expected_start.date():
+        return (
+            "forecast_start_mismatch:"
+            f"expected={expected_start.date().isoformat()},actual={forecast_points[0][0].date().isoformat()}"
+        )
+
+    if granularity == "day":
+        for idx in range(1, len(forecast_points)):
+            delta = forecast_points[idx][0] - forecast_points[idx - 1][0]
+            if delta != timedelta(days=1):
+                return (
+                    "forecast_daily_spacing_invalid:"
+                    f"index={idx},delta_seconds={int(delta.total_seconds())}"
+                )
+    return ""
+
+
 def _build_historical_only_dataset(
     *,
     ordered: list[tuple[datetime, float]],
@@ -642,13 +685,31 @@ def build_forecast_dataset(
     for idx, value in enumerate(forecast_values, start=1):
         forecast_points.append((last_dt + (frequency * idx), float(value)))
 
-    merged_rows: list[dict[str, Any]] = [
+    validation_error = _validate_forecast_points(
+        ordered=ordered,
+        forecast_points=forecast_points,
+        resolved_horizon=resolved_horizon,
+        granularity=granularity,
+    )
+    if validation_error:
+        return _build_historical_only_dataset(
+            ordered=ordered,
+            time_column=time_column,
+            value_column=value_column,
+            reason=validation_error,
+            selected_time_column_reason=selected_time_column_reason,
+            granularity=granularity,
+            validation_message=validation_error,
+        )
+
+    merged_rows_unsorted: list[dict[str, Any]] = [
         _series_row(dt, float(value), "actual")
         for dt, value in ordered
     ] + [
         _series_row(dt, float(value), "forecast")
         for dt, value in forecast_points
     ]
+    merged_rows = _sort_series_rows(merged_rows_unsorted)
 
     model_status = forecast_output.get("model_status", {}) if isinstance(forecast_output.get("model_status"), dict) else {}
     fallback_reason = str(model_status.get("fallback_reason", "")).strip()

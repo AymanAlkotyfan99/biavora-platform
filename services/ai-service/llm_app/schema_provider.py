@@ -159,7 +159,22 @@ def get_schema_for_dataset(
         strict_scope=True,
     )
     if len(schema) != 1:
-        raise DatasetBindingError("Dataset-table mismatch: invalid ETL binding")
+        bound = str(dataset_context.get("table_name", "")).strip()
+        suffix = bound.split(".")[-1].lower() if bound else ""
+        narrowed: dict[str, list[dict[str, Any]]] = {}
+        if suffix:
+            for table_name, columns in schema.items():
+                if str(table_name).strip().split(".")[-1].lower() == suffix:
+                    narrowed[str(table_name)] = columns
+                    break
+        if len(narrowed) == 1:
+            return narrowed
+        keys = list(schema.keys())[:25]
+        raise DatasetBindingError(
+            "Dataset-table mismatch: invalid ETL binding "
+            f"(expected exactly one scoped table for dataset_id={dataset_context.get('dataset_id')!r} "
+            f"table_name={bound!r}; got {len(schema)} tables: {keys!r})"
+        )
     return schema
 
 

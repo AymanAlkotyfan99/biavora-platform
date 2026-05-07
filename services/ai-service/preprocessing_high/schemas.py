@@ -96,11 +96,20 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return str(raw_value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class HighPreprocessConfig:
     ollama_url: str
     ollama_model: str
     request_timeout_seconds: float
+    enable_llm_schema_validation: bool
+    llm_schema_validation_timeout_seconds: float
     max_retries: int
     clickhouse_host: str
     clickhouse_port: int
@@ -113,11 +122,20 @@ class HighPreprocessConfig:
 
     @classmethod
     def from_env(cls) -> "HighPreprocessConfig":
-        retries = _env_int("PREPROCESS_HIGH_MAX_RETRIES", 2)
+        from shared.ollama_env import global_ollama_read_timeout_seconds
+
+        retries = _env_int("OLLAMA_SCHEMA_VALIDATION_MAX_RETRIES", _env_int("PREPROCESS_HIGH_MAX_RETRIES", 1))
+        ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434").strip()
+        default_ollama_url = f"{ollama_host.rstrip('/')}/api/generate"
         return cls(
-            ollama_url=os.getenv("PREPROCESS_HIGH_OLLAMA_URL", "http://localhost:11434/api/generate"),
+            ollama_url=os.getenv("PREPROCESS_HIGH_OLLAMA_URL", default_ollama_url),
             ollama_model=os.getenv("PREPROCESS_HIGH_OLLAMA_MODEL", "gemma3:1b"),
-            request_timeout_seconds=_env_float("PREPROCESS_HIGH_TIMEOUT_SECONDS", 20.0),
+            request_timeout_seconds=_env_float(
+                "PREPROCESS_HIGH_TIMEOUT_SECONDS",
+                global_ollama_read_timeout_seconds(),
+            ),
+            enable_llm_schema_validation=_env_bool("ENABLE_LLM_SCHEMA_VALIDATION", False),
+            llm_schema_validation_timeout_seconds=_env_float("OLLAMA_SCHEMA_VALIDATION_TIMEOUT", 90.0),
             max_retries=max(0, min(retries, 3)),
             clickhouse_host=os.getenv("CLICKHOUSE_HOST", "localhost"),
             clickhouse_port=_env_int("CLICKHOUSE_PORT", 8123),

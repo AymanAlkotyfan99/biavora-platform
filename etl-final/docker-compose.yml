@@ -9,6 +9,7 @@ services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     container_name: zookeeper
+    restart: unless-stopped
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
@@ -18,29 +19,42 @@ services:
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: kafka
+    restart: unless-stopped
     depends_on:
       - zookeeper
     ports:
       - "9092:9092"
+      - "29092:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://host.docker.internal:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - kafka-broker-api-versions --bootstrap-server localhost:9092 > /dev/null 2>&1
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
+    restart: unless-stopped
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     ports:
       - "8081:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: local
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092,host.docker.internal:29092
 
   surrealdb:
     image: surrealdb/surrealdb:latest
@@ -91,13 +105,14 @@ services:
       context: .
       dockerfile: connector-service/Dockerfile
     container_name: connector-service
+    restart: unless-stopped
     ports:
       - "8001:8000"
     volumes:
       - uploaded-files:/app/uploaded_files
     environment:
       PYTHONPATH: "/app"
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092,host.docker.internal:29092
       KAFKA_ENABLE_TOPIC_ALIASING: "true"
       KAFKA_REQUIRED_TOPICS: "raw_data,transformed_data,load_requests,metadata_updates,errors,quarantine,connection_topic,schema_topic,extracted_rows_topic,clean_rows_topic,load_rows_topic,metadata_topic,extracted_rows_dlq,clean_rows_dlq,load_rows_dlq"
       CLICKHOUSE_HOST: clickhouse
@@ -117,22 +132,26 @@ services:
       CLAMAV_PORT: "3310"
       CLAMAV_TIMEOUT: "30"
     depends_on:
-      - kafka
-      - surrealdb
-      - clamav
+      kafka:
+        condition: service_healthy
+      surrealdb:
+        condition: service_started
+      clamav:
+        condition: service_started
 
   detector-service:
     build:
       context: .
       dockerfile: detector-service/Dockerfile
     container_name: detector-service
+    restart: unless-stopped
     profiles:
       - optional
     ports:
       - "8002:8000"
     environment:
       PYTHONPATH: "/app"
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092,host.docker.internal:29092
       KAFKA_ENABLE_TOPIC_ALIASING: "true"
       KAFKA_REQUIRED_TOPICS: "raw_data,transformed_data,load_requests,metadata_updates,errors,quarantine,connection_topic,schema_topic,extracted_rows_topic,clean_rows_topic,load_rows_topic,metadata_topic,extracted_rows_dlq,clean_rows_dlq,load_rows_dlq"
       CLICKHOUSE_HOST: clickhouse
@@ -146,21 +165,24 @@ services:
       SURREAL_NS: "bi_etl"
       SURREAL_DB: "etl_logs"
     depends_on:
-      - kafka
-      - surrealdb
+      kafka:
+        condition: service_healthy
+      surrealdb:
+        condition: service_started
 
   extractor-service:
     build:
       context: .
       dockerfile: extractor-service/Dockerfile
     container_name: extractor-service
+    restart: unless-stopped
     ports:
       - "8003:8000"
     volumes:
       - uploaded-files:/app/uploaded_files
     environment:
       PYTHONPATH: "/app"
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092,host.docker.internal:29092
       KAFKA_ENABLE_TOPIC_ALIASING: "true"
       KAFKA_REQUIRED_TOPICS: "raw_data,transformed_data,load_requests,metadata_updates,errors,quarantine,connection_topic,schema_topic,extracted_rows_topic,clean_rows_topic,load_rows_topic,metadata_topic,extracted_rows_dlq,clean_rows_dlq,load_rows_dlq"
       EXTRACTOR_DLQ_TOPIC: errors
@@ -175,19 +197,22 @@ services:
       SURREAL_NS: "bi_etl"
       SURREAL_DB: "etl_logs"
     depends_on:
-      - kafka
-      - surrealdb
+      kafka:
+        condition: service_healthy
+      surrealdb:
+        condition: service_started
 
   transformer-service:
     build:
       context: .
       dockerfile: transformer-service/Dockerfile
     container_name: transformer-service
+    restart: unless-stopped
     ports:
       - "8004:8000"
     environment:
       PYTHONPATH: "/app"
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092,host.docker.internal:29092
       KAFKA_ENABLE_TOPIC_ALIASING: "true"
       KAFKA_REQUIRED_TOPICS: "raw_data,transformed_data,load_requests,metadata_updates,errors,quarantine,connection_topic,schema_topic,extracted_rows_topic,clean_rows_topic,load_rows_topic,metadata_topic,extracted_rows_dlq,clean_rows_dlq,load_rows_dlq"
       TRANSFORMER_DLQ_TOPIC: errors
@@ -202,19 +227,22 @@ services:
       SURREAL_NS: "bi_etl"
       SURREAL_DB: "etl_logs"
     depends_on:
-      - kafka
-      - surrealdb
+      kafka:
+        condition: service_healthy
+      surrealdb:
+        condition: service_started
 
   loader-service:
     build:
       context: .
       dockerfile: loader-service/Dockerfile
     container_name: loader-service
+    restart: unless-stopped
     ports:
       - "8005:8000"
     environment:
       PYTHONPATH: "/app"
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092,host.docker.internal:29092
       KAFKA_ENABLE_TOPIC_ALIASING: "true"
       KAFKA_REQUIRED_TOPICS: "raw_data,transformed_data,load_requests,metadata_updates,errors,quarantine,connection_topic,schema_topic,extracted_rows_topic,clean_rows_topic,load_rows_topic,metadata_topic,extracted_rows_dlq,clean_rows_dlq,load_rows_dlq"
       LOADER_DLQ_TOPIC: errors
@@ -229,20 +257,24 @@ services:
       SURREAL_NS: "bi_etl"
       SURREAL_DB: "etl_logs"
     depends_on:
-      - kafka
-      - clickhouse
-      - surrealdb
+      kafka:
+        condition: service_healthy
+      clickhouse:
+        condition: service_started
+      surrealdb:
+        condition: service_started
 
   metadata-service:
     build:
       context: .
       dockerfile: metadata-service/Dockerfile
     container_name: metadata-service
+    restart: unless-stopped
     ports:
       - "8006:8000"
     environment:
       PYTHONPATH: "/app"
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092,host.docker.internal:29092
       KAFKA_ENABLE_TOPIC_ALIASING: "true"
       KAFKA_REQUIRED_TOPICS: "raw_data,transformed_data,load_requests,metadata_updates,errors,quarantine,connection_topic,schema_topic,extracted_rows_topic,clean_rows_topic,load_rows_topic,metadata_topic,extracted_rows_dlq,clean_rows_dlq,load_rows_dlq"
       SURREAL_URL: "http://surrealdb:8000/sql"
@@ -251,8 +283,10 @@ services:
       SURREAL_NS: "bi_etl"
       SURREAL_DB: "etl_logs"
     depends_on:
-      - kafka
-      - surrealdb
+      kafka:
+        condition: service_healthy
+      surrealdb:
+        condition: service_started
 
 volumes:
   uploaded-files:
@@ -260,3 +294,5 @@ volumes:
   clickhouse_data:
   clickhouse_logs:
   clamav_data:
+
+

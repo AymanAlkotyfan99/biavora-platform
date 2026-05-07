@@ -9,10 +9,10 @@ VALID_DIRECTIONS = {"ASC", "DESC"}
 VALID_OPERATORS = {"=", "!=", ">", "<", ">=", "<=", "IN", "LIKE", "BETWEEN"}
 TIME_GRANULARITY_EXPRESSIONS = {
     "day": "toDate({column})",
-    "week": "toStartOfWeek({column})",
-    "month": "toStartOfMonth({column})",
-    "quarter": "toStartOfQuarter({column})",
-    "year": "toYear({column})",
+    "week": "toStartOfWeek(toDate({column}))",
+    "month": "toStartOfMonth(toDate({column}))",
+    "quarter": "toStartOfQuarter(toDate({column}))",
+    "year": "toStartOfYear(toDate({column}))",
 }
 BUSINESS_METRIC_HINT_TOKENS = (
     "sales",
@@ -27,11 +27,104 @@ BUSINESS_METRIC_HINT_TOKENS = (
 )
 
 
-def compile_sql(intent: dict[str, Any], schema: dict[str, list[dict[str, Any]]]) -> str:
+# Phase 6 / CRIT-05: default ClickHouse settings injected at the head of every
+# generated query. They are encoded as a structured comment so the executor
+# can parse them deterministically and apply them via ``SETTINGS``.
+DEFAULT_CH_SETTINGS = {
+    "max_execution_time": 60,
+    "max_result_rows": 100_000,
+    "readonly": 2,
+}
+
+
+def _format_ch_settings(settings: dict[str, Any]) -> str:
+    """Produce the canonical ``/* ch_settings: ... */`` header.
+
+    Phase 6 / CRIT-05: every compiled query carries this header so
+    downstream services (sql_review, query-service executor) can apply the
+    same execution limits without re-implementing them.
+    """
+
+    parts: list[str] = []
+    for key, value in sorted((settings or {}).items()):
+        key_str = str(key).strip()
+        if not key_str:
+            continue
+        if isinstance(value, bool):
+            value_str = "1" if value else "0"
+        elif isinstance(value, (int, float)):
+            value_str = str(value)
+        else:
+            value_str = str(value).replace("*/", "")
+        parts.append(f"{key_str}={value_str}")
+    return "/* ch_settings: " + ", ".join(parts) + " */" if parts else ""
+
+
+def _resolve_workspace_db(
+    *,
+    intent: dict[str, Any],
+    workspace_clickhouse_db: str | None,
+) -> str:
+    """Resolve the per-tenant ClickHouse database used to qualify the table.
+
+    Phase 6 / CRIT-05: the legacy ``CLICKHOUSE_DATABASE=etl`` default is
+    forbidden. The compiler accepts ``workspace_clickhouse_db`` either as an
+    explicit kwarg or through ``intent['workspace_clickhouse_db']``. As a
+    very last resort it reads ``CLICKHOUSE_DATABASE`` (for legacy unit tests
+    that still rely on the env var). It never silently falls back to the
+    string ``"etl"``.
+    """
+
+    candidate = ""
+    raw = (
+        workspace_clickhouse_db
+        or intent.get("workspace_clickhouse_db")
+        or intent.get("clickhouse_db")
+    )
+    if isinstance(raw, str):
+        candidate = raw.strip()
+    if not candidate:
+        # Audit Phase 6 / CRIT-05: NO hardcoded ``etl`` fallback. We only
+        # honour the env var when an operator has *explicitly* set it (we
+        # do not provide ``"etl"`` as the default any more).
+        env_value = str(os.getenv("CLICKHOUSE_DATABASE", "")).strip()
+        if env_value:
+            candidate = env_value
+    if not candidate:
+        raise ValueError(
+            "compile_sql requires a workspace ClickHouse database (workspace_clickhouse_db). "
+            "No tenant database was supplied and CLICKHOUSE_DATABASE is not set."
+        )
+    return candidate
+
+
+def compile_sql(
+    intent: dict[str, Any],
+    schema: dict[str, list[dict[str, Any]]],
+    *,
+    workspace_clickhouse_db: str | None = None,
+    ch_settings: dict[str, Any] | None = None,
+) -> str:
+    """Compile structured intent into a ClickHouse-flavoured SQL statement.
+
+    Phase 6 / CRIT-05:
+    - ``workspace_clickhouse_db`` (or ``intent['workspace_clickhouse_db']``)
+      is **required** so the FROM clause is always per-tenant qualified
+      (``<workspace_db>.<table>``). The legacy ``etl`` default has been
+      removed.
+    - The compiled SQL carries a canonical ``/* ch_settings: ... */`` header
+      so downstream services can apply identical execution limits.
+    - Histograms never produce a raw ``GROUP BY`` over the continuous
+      column; we always materialise a bucket expression.
+    """
+
     raw_table = intent.get("table")
     if not raw_table:
         raise ValueError("Intent is missing table name")
-    default_db = os.getenv("CLICKHOUSE_DATABASE", "etl")
+    default_db = _resolve_workspace_db(
+        intent=intent,
+        workspace_clickhouse_db=workspace_clickhouse_db,
+    )
 
     from_table = _normalize_and_validate_table_name(raw_table, default_db)
     schema_table = _resolve_schema_table_name(raw_table, schema)
@@ -54,11 +147,38 @@ def compile_sql(intent: dict[str, Any], schema: dict[str, list[dict[str, Any]]])
     type_cast_map = _build_type_cast_map(intent.get("type_casting") or intent.get("type_casting_needed") or [])
     time_granularity = str(intent.get("time_granularity", "")).strip().lower()
     time_column = str(intent.get("time_column", "")).strip()
-    time_grouping_detected = bool(intent.get("time_grouping_detected"))
+    time_grouping_detected = bool(intent.get("time_grouping_detected") or intent.get("group_by_time"))
     row_count_requested = bool(intent.get("row_count_requested"))
-    time_dimension_alias = str(intent.get("time_dimension_alias", "")).strip() or "period"
+    time_dimension_alias = str(intent.get("time_dimension_alias", "")).strip() or (
+        "date" if time_grouping_detected else "period"
+    )
     time_dimension_expression = str(intent.get("time_dimension_expression", "")).strip()
     explicit_top_n_requested = bool(intent.get("explicit_top_n_requested"))
+    metric_type = str(intent.get("metric_type", "")).strip().lower()
+    is_percentage_intent = bool(intent.get("is_percentage")) or metric_type in {"percentage", "percent", "ratio"}
+    # Phase 6 / CRIT-05: histogram dimensions must be bucketed, never raw.
+    selected_chart_type = (
+        str(intent.get("selected_chart_type", "")).strip().lower()
+        or str(intent.get("chart_type", "")).strip().lower()
+        or str((intent.get("chart") or {}).get("type", "")).strip().lower()
+    )
+    # Respect explicit upstream chart lock/type. Distribution-like operations
+    # should not force histogram SQL when the selected chart is pie/line/etc.
+    distribution_requested = bool(intent.get("is_distribution")) or (
+        "distribution" in {str(op).strip().lower() for op in (intent.get("operations") or [])}
+    )
+    is_histogram_intent = (
+        selected_chart_type == "histogram"
+        or (
+            distribution_requested
+            and selected_chart_type in {"", "histogram"}
+        )
+    )
+    histogram_bin_count_raw = intent.get("histogram_bin_count")
+    try:
+        histogram_bin_count = max(2, min(200, int(histogram_bin_count_raw)))
+    except (TypeError, ValueError):
+        histogram_bin_count = 20
     if (
         time_grouping_detected
         and time_granularity in TIME_GRANULARITY_EXPRESSIONS
@@ -69,6 +189,75 @@ def compile_sql(intent: dict[str, Any], schema: dict[str, list[dict[str, Any]]])
             column_name=time_column,
             column_map=column_map,
         )
+
+    # Distribution intent must compile to histogram buckets directly in SQL.
+    if is_histogram_intent:
+        histogram_metric = ""
+        for metric in metrics:
+            if isinstance(metric, dict):
+                candidate = str(metric.get("column") or "").strip()
+            else:
+                candidate = str(metric or "").strip()
+            if candidate and candidate in column_map and is_numeric_type(column_map[candidate].get("type", "")):
+                histogram_metric = candidate
+                break
+        if not histogram_metric:
+            for candidate in dimensions:
+                if candidate in column_map and is_numeric_type(column_map[candidate].get("type", "")):
+                    histogram_metric = candidate
+                    break
+        if not histogram_metric:
+            raise ValueError("Histogram intent requires a numeric metric column.")
+
+        where_clause = _build_where_clause(filters, column_map, type_cast_map)
+        where_sql = f"\n{where_clause}" if where_clause else ""
+        settings_to_emit: dict[str, Any] = dict(DEFAULT_CH_SETTINGS)
+        if isinstance(intent.get("ch_settings"), dict):
+            settings_to_emit.update(intent["ch_settings"])
+        if ch_settings:
+            settings_to_emit.update(ch_settings)
+        settings_comment = _format_ch_settings(settings_to_emit)
+
+        stats_tail = (
+            f"{where_sql}\n      AND {histogram_metric} IS NOT NULL"
+            if where_clause
+            else f"\n    WHERE {histogram_metric} IS NOT NULL\n"
+        )
+        histogram_sql = (
+            "WITH stats AS (\n"
+            f"    SELECT min({histogram_metric}) AS min_value,\n"
+            f"           max({histogram_metric}) AS max_value,\n"
+            "           count(*) AS row_count\n"
+            f"    FROM {from_table}"
+            f"{stats_tail}"
+        )
+        histogram_sql += (
+            "), params AS (\n"
+            "    SELECT\n"
+            "        min_value,\n"
+            "        max_value,\n"
+            "        row_count,\n"
+            "        least(30.0, greatest(5.0, sqrt(greatest(row_count, 1)))) AS bins,\n"
+            "        greatest(1.0, (max_value - min_value) / least(30.0, greatest(5.0, sqrt(greatest(row_count, 1))))) AS bin_size\n"
+            "    FROM stats\n"
+            ")\n"
+            "SELECT floor(t."
+            + histogram_metric
+            + " / p.bin_size) * p.bin_size AS bucket,\n"
+            "       count(*) AS frequency\n"
+            f"FROM {from_table} AS t\n"
+            "CROSS JOIN params AS p"
+        )
+        if where_clause:
+            histogram_sql += f"\n{where_clause} AND t.{histogram_metric} IS NOT NULL"
+        else:
+            histogram_sql += f"\nWHERE t.{histogram_metric} IS NOT NULL"
+        histogram_sql += "\nGROUP BY bucket\nORDER BY bucket ASC;"
+        histogram_sql = _normalize_clickhouse_date_casts(histogram_sql)
+        _validate_sql_structure(histogram_sql)
+        if settings_comment:
+            histogram_sql = f"{settings_comment}\n{histogram_sql}"
+        return histogram_sql
 
     select_parts: list[str] = []
     group_by_parts: list[str] = []
@@ -90,6 +279,21 @@ def compile_sql(intent: dict[str, Any], schema: dict[str, list[dict[str, Any]]])
             group_by_parts.append(time_dimension_alias)
             dimension_aliases[time_dimension_alias] = time_dimension_alias
             continue
+        # Phase 6 / CRIT-05: histogram on a continuous numeric column must
+        # bucket the column rather than ``GROUP BY`` the raw value, which
+        # would explode cardinality and break downstream rendering.
+        if is_histogram_intent and is_numeric_type(column_map[dim].get("type", "")):
+            bin_alias = f"{dim}_bin"
+            bin_expression = (
+                f"(floor(({dim} - (SELECT min({dim}) FROM {from_table})) / "
+                f"((SELECT (max({dim}) - min({dim})) FROM {from_table}) / {histogram_bin_count})) * "
+                f"((SELECT (max({dim}) - min({dim})) FROM {from_table}) / {histogram_bin_count}) + "
+                f"(SELECT min({dim}) FROM {from_table}))"
+            )
+            select_parts.append(f"{bin_expression} AS {bin_alias}")
+            group_by_parts.append(bin_alias)
+            dimension_aliases[bin_alias] = bin_alias
+            continue
         select_parts.append(dim)
         group_by_parts.append(dim)
         dimension_aliases[dim] = dim
@@ -104,6 +308,16 @@ def compile_sql(intent: dict[str, Any], schema: dict[str, list[dict[str, Any]]])
         aggregation = (raw_aggregation or "").upper()
         if aggregation in {"", "NONE", "NULL"}:
             aggregation = ""
+        needs_agg_default = bool(time_grouping_detected or dimensions) and not row_count_requested
+        if (
+            needs_agg_default
+            and not aggregation
+            and isinstance(column, str)
+            and column not in ("*", "")
+            and column in column_map
+            and is_numeric_type(column_map[column].get("type", ""))
+        ):
+            aggregation = "SUM"
         if (
             aggregation == "COUNT"
             and not row_count_requested
@@ -142,7 +356,11 @@ def compile_sql(intent: dict[str, Any], schema: dict[str, list[dict[str, Any]]])
                         f"Aggregation '{aggregation}' requires numeric column, got '{column}' ({column_map[column].get('type')})"
                     )
                 if aggregation:
-                    expression = f"{aggregation}({metric_expr})"
+                    base_expression = f"{aggregation}({metric_expr})"
+                    if is_percentage_intent and aggregation in {"SUM", "COUNT", "AVG", "MIN", "MAX"}:
+                        expression = f"({base_expression} / NULLIF(SUM({base_expression}) OVER (), 0))"
+                    else:
+                        expression = base_expression
                     has_aggregated_metric = True
                 else:
                     expression = metric_expr
@@ -212,9 +430,30 @@ def compile_sql(intent: dict[str, Any], schema: dict[str, list[dict[str, Any]]])
         raise ValueError("Unsafe time-grouped SQL shape: aggregation over time requires GROUP BY transformed time dimension.")
 
     where_clause = _build_where_clause(filters, column_map, type_cast_map)
-    if has_aggregated_metric and time_grouping_detected and time_dimension_alias:
+    if time_grouping_detected and time_column and _is_string_like_type(column_map.get(time_column, {}).get("type", "")):
+        parsed_time_expr = _string_time_parse_expr(time_column)
+        extra_predicates = [f"{parsed_time_expr} IS NOT NULL"]
+        for metric in metrics:
+            if not isinstance(metric, dict):
+                continue
+            metric_column = str(metric.get("column", "")).strip()
+            if metric_column and metric_column != "*" and metric_column in column_map:
+                extra_predicates.append(f"{metric_column} IS NOT NULL")
+        deduped_predicates: list[str] = []
+        seen_predicates: set[str] = set()
+        for predicate in extra_predicates:
+            if predicate in seen_predicates:
+                continue
+            seen_predicates.add(predicate)
+            deduped_predicates.append(predicate)
+        if deduped_predicates:
+            if where_clause:
+                where_clause = f"{where_clause} AND " + " AND ".join(deduped_predicates)
+            else:
+                where_clause = "WHERE " + " AND ".join(deduped_predicates)
+    if has_aggregated_metric and time_grouping_detected and time_dimension_alias and not ranking_requested:
         order_by = [{"column": time_dimension_alias, "direction": "ASC"}]
-    if time_grouping_detected and not explicit_top_n_requested:
+    if time_grouping_detected and not explicit_top_n_requested and not ranking_requested:
         limit = None
     order_clause = _build_order_clause(order_by, column_map, metric_aliases, dimension_aliases)
     limit_clause = _build_limit_clause(limit)
@@ -235,6 +474,18 @@ def compile_sql(intent: dict[str, Any], schema: dict[str, list[dict[str, Any]]])
     final_sql = "\n".join(sql_parts) + ";"
     final_sql = _normalize_clickhouse_date_casts(final_sql)
     _validate_sql_structure(final_sql)
+
+    # Phase 6 / CRIT-05: prepend a canonical ClickHouse settings comment so
+    # downstream services (sql_review, query-service executor) can apply
+    # identical execution limits without re-deriving them.
+    settings_to_emit: dict[str, Any] = dict(DEFAULT_CH_SETTINGS)
+    if isinstance(intent.get("ch_settings"), dict):
+        settings_to_emit.update(intent["ch_settings"])
+    if ch_settings:
+        settings_to_emit.update(ch_settings)
+    settings_comment = _format_ch_settings(settings_to_emit)
+    if settings_comment:
+        final_sql = f"{settings_comment}\n{final_sql}"
     return final_sql
 
 
@@ -512,9 +763,22 @@ def _build_time_dimension_expression(
     column_type = str(column_map.get(column_name, {}).get("type", "")).strip().lower()
     base_column = column_name
     if _is_string_like_type(column_type):
-        base_column = f"toDate({column_name})"
+        parsed_expr = _string_time_parse_expr(column_name)
+        if granularity == "day":
+            return f"toDate({parsed_expr})"
+        base_column = parsed_expr
     expression = template.format(column=base_column)
     return _normalize_clickhouse_date_casts(expression)
+
+
+def _string_time_parse_expr(column_name: str) -> str:
+    # Prefer US parsing for ambiguous M/D/YYYY sources, then fallback to generic parsing.
+    return (
+        f"coalesce("
+        f"parseDateTimeBestEffortUSOrNull({column_name}), "
+        f"parseDateTimeBestEffortOrNull({column_name})"
+        f")"
+    )
 
 
 def _infer_groupable_dimension(columns: list[dict[str, Any]]) -> str | None:

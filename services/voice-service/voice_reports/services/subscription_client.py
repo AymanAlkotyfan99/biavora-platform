@@ -9,6 +9,13 @@ import logging
 import requests
 from django.conf import settings
 
+try:  # pragma: no cover
+    from bi_platform_shared.http import HttpClientError, get_default_client
+    _SHARED_CLIENT_AVAILABLE = True
+except Exception:  # pragma: no cover
+    HttpClientError = Exception  # type: ignore[assignment,misc]
+    _SHARED_CLIENT_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,12 +35,27 @@ class SubscriptionClient:
         }
 
         try:
-            response = requests.get(
-                self.check_access_endpoint,
-                params=params,
-                headers=headers,
-                timeout=(5, 15),
-            )
+            if _SHARED_CLIENT_AVAILABLE:
+                response = get_default_client().get(
+                    self.check_access_endpoint,
+                    params=params,
+                    headers=headers,
+                    timeout=(5.0, 15.0),
+                    attach_internal_api_key=False,
+                )
+            else:
+                response = requests.get(
+                    self.check_access_endpoint,
+                    params=params,
+                    headers=headers,
+                    timeout=(5, 15),
+                )
+        except HttpClientError as exc:  # type: ignore[misc]
+            logger.error('Subscription check access failed workspace=%s error=%s', workspace_id, exc)
+            return {
+                'success': False,
+                'error': f'subscription_service_unavailable: {exc}',
+            }
         except requests.RequestException as exc:
             logger.error('Subscription check access failed workspace=%s error=%s', workspace_id, exc)
             return {

@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 
 IntentType = Literal["analytical", "predictive"]
-IntentExtractionErrorType = Literal["none", "system", "model", "input", "schema_mismatch", "unknown"]
+IntentExtractionErrorType = Literal[
+    "none",
+    "system",
+    "model",
+    "input",
+    "schema_mismatch",
+    "query_service_auth",
+    "unknown",
+]
 IntentExtractionActionType = Literal["retry", "stop", "proceed"]
 NextStepType = Literal["metabase", "forecasting"]
 
@@ -27,6 +35,10 @@ class StructuredIntent(TypedDict):
     ranking: dict[str, Any]
     operations: list[str]
     ambiguities: list[dict[str, Any]]
+    chart: NotRequired[dict[str, Any]]
+    metric_type: NotRequired[str]
+    selected_chart_type: NotRequired[str]
+    chart_type: NotRequired[str]
 
 
 class IntentExtractionTaskResult(TypedDict, total=False):
@@ -84,12 +96,20 @@ class IntentExtractionConfig:
 
     @classmethod
     def from_env(cls) -> "IntentExtractionConfig":
+        from shared.ollama_env import global_ollama_read_timeout_seconds
+
         retries = _env_int("INTENT_EXTRACTION_MAX_RETRIES", 2)
+        ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434").strip()
+        default_ollama_url = f"{ollama_host.rstrip('/')}/api/generate"
+        global_timeout = global_ollama_read_timeout_seconds()
         return cls(
             llm_provider=os.getenv("INTENT_EXTRACTION_LLM_PROVIDER", "openrouter").strip().lower(),
-            ollama_url=os.getenv("INTENT_EXTRACTION_OLLAMA_URL", "http://localhost:11434/api/generate"),
+            ollama_url=os.getenv("INTENT_EXTRACTION_OLLAMA_URL", default_ollama_url),
             ollama_model=os.getenv("INTENT_EXTRACTION_OLLAMA_MODEL", "gemma3:1b"),
-            request_timeout_seconds=_env_float("INTENT_EXTRACTION_TIMEOUT_SECONDS", 20.0),
+            request_timeout_seconds=_env_float(
+                "INTENT_EXTRACTION_TIMEOUT_SECONDS",
+                _env_float("OLLAMA_INTENT_TIMEOUT", global_timeout),
+            ),
             max_retries=max(0, min(retries, 3)),
             clickhouse_executor_path=os.getenv("INTENT_EXTRACTION_CLICKHOUSE_EXECUTOR_PATH", "").strip(),
             metabase_handler_path=os.getenv("INTENT_EXTRACTION_METABASE_HANDLER_PATH", "").strip(),

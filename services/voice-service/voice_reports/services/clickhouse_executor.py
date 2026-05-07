@@ -5,12 +5,14 @@ Executes validated SQL queries on ClickHouse.
 Returns results for visualization.
 """
 
+import hashlib
 import clickhouse_connect
 import os
 import logging
 import math
 from typing import Dict, List, Optional, Any
 
+from bi_platform_shared.sql import sanitize_sql_for_metabase
 from voice_reports.utils import normalize_sql_table_references
 
 logger = logging.getLogger(__name__)
@@ -48,6 +50,7 @@ def sanitize_sql_for_http(sql: str) -> str:
     if not sql:
         return ""
 
+    original_sql = sql
     # Global fix: normalize invalid ClickHouse cast functions
     sql = _normalize_invalid_casts(sql)
 
@@ -55,12 +58,16 @@ def sanitize_sql_for_http(sql: str) -> str:
     import re
     clean_sql = re.sub(r'\s+FORMAT\s+Native\s*', ' ', sql, flags=re.IGNORECASE)
 
-    # Remove all semicolons
-    clean_sql = clean_sql.replace(';', '')
+    # Normalize trailing semicolons using shared sanitizer.
+    if str(clean_sql).strip().endswith(";"):
+        logger.warning("Trailing semicolon detected and removed for Metabase compatibility")
+    clean_sql = sanitize_sql_for_metabase(clean_sql)
 
     # Remove extra whitespace and trim
     clean_sql = ' '.join(clean_sql.split())
     clean_sql = clean_sql.strip()
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("SQL sanitization original_sql=%r sanitized_sql=%r", original_sql, clean_sql)
 
     return clean_sql
 
@@ -292,10 +299,13 @@ class ClickHouseExecutor:
             import time
             start_time = time.time()
 
-            logger.error("RAW SQL BEFORE NORMALIZATION:")
-            logger.error("=" * 80)
-            logger.error(sql)
-            logger.error("=" * 80)
+            # Phase 11 / CRIT-08: never log raw SQL — hash only for diagnostics.
+            sql_fingerprint = hashlib.sha256((sql or "").encode("utf-8", errors="replace")).hexdigest()
+            logger.info(
+                "clickhouse_execute_sql_fingerprint fingerprint_sha256=%s sql_len=%s",
+                sql_fingerprint,
+                len(sql or ""),
+            )
 
             normalized_sql = sql
             # Only normalize SELECT queries; keep admin statements unchanged.
@@ -305,12 +315,12 @@ class ClickHouseExecutor:
             # Sanitize SQL for HTTP execution (removes FORMAT Native, semicolons)
             clean_sql = sanitize_sql_for_http(normalized_sql)
             
-            # 🔍 FINAL SQL BOUNDARY LOGGING (MANDATORY)
-            # This logs the EXACT query sent to ClickHouse
-            logger.error("🚨 FINAL SQL SENT TO CLICKHOUSE:")
-            logger.error("="*80)
-            logger.error(clean_sql)
-            logger.error("="*80)
+            clean_fingerprint = hashlib.sha256((clean_sql or "").encode("utf-8", errors="replace")).hexdigest()
+            logger.info(
+                "clickhouse_final_sql_fingerprint fingerprint_sha256=%s sql_len=%s",
+                clean_fingerprint,
+                len(clean_sql or ""),
+            )
             
             # Execute query using clickhouse-connect
             result = self.client.query(clean_sql)

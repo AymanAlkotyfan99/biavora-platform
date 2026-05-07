@@ -34,8 +34,112 @@ from preprocessing_high.schemas import (
     build_preprocess_high_rejected_result,
     build_preprocess_high_success_result,
 )
+from shared.analytical_time_semantics import question_requests_analytical_time
 from shared.confidence import schema_confidence
 from shared.pipeline_trace import make_attempt
+from shared.schema_utils import is_date_type, is_numeric_type
+from shared.time_semantics_detector import extract_longest_time_keyword
+
+
+# Phase 5 / CRIT-14: forecasting must NEVER skip schema validation. The
+# orchestrator surfaces ``forecast_missing_time_column`` /
+# ``forecast_missing_target_column`` when a forecast question hits a dataset
+# that lacks a Date/DateTime column or a numeric target column.
+FORECAST_MISSING_TIME_COLUMN = "forecast_missing_time_column"
+FORECAST_MISSING_TARGET_COLUMN = "forecast_missing_target_column"
+FORECAST_TIME_COLUMN_CANDIDATES = (
+    "ds",
+    "date",
+    "datetime",
+    "timestamp",
+    "time",
+    "created_at",
+    "updated_at",
+    "order_date",
+    "sales_date",
+)
+
+
+def _resolve_forecast_columns(
+    *,
+    loaded_schema,
+    dataset_scope: dict[str, object] | None,
+    query_text: str = "",
+) -> tuple[str, str, str]:
+    """Resolve the forecast date/target columns from the loaded schema.
+
+    Returns ``(table, forecast_date_column, forecast_target_column)``. If a
+    bound ``dataset_scope.table_name`` is provided we restrict the search to
+    that table; otherwise we scan every table the schema exposes.
+    """
+
+    columns_obj = loaded_schema.schema.get("columns", {}) if loaded_schema is not None else {}
+    if not isinstance(columns_obj, dict):
+        return "", "", ""
+
+    bound_table = ""
+    if isinstance(dataset_scope, dict):
+        bound_table = str(dataset_scope.get("table_name", "")).strip()
+
+    candidates: list[tuple[str, list[dict[str, object]]]] = []
+    if bound_table:
+        bound_columns = columns_obj.get(bound_table)
+        if not bound_columns:
+            for table_name, table_columns in columns_obj.items():
+                if str(table_name).split(".")[-1].lower() == bound_table.split(".")[-1].lower():
+                    bound_columns = table_columns
+                    bound_table = str(table_name)
+                    break
+        if isinstance(bound_columns, list):
+            candidates.append((bound_table, bound_columns))
+    else:
+        for table_name, table_columns in columns_obj.items():
+            if isinstance(table_columns, list):
+                candidates.append((str(table_name), table_columns))
+
+    query_tokens = set(re.findall(r"[a-z0-9_]+", str(query_text or "").lower()))
+
+    for table_name, table_columns in candidates:
+        date_column = ""
+        target_column = ""
+        scored_targets: list[tuple[int, str]] = []
+        for col in table_columns:
+            if not isinstance(col, dict):
+                continue
+            name = str(col.get("name", "")).strip()
+            col_type = str(col.get("type", "")).strip()
+            if not name:
+                continue
+            lowered_name = name.lower()
+            if not date_column and (
+                lowered_name in FORECAST_TIME_COLUMN_CANDIDATES
+                or is_date_type(col_type)
+            ):
+                date_column = name
+            if is_numeric_type(col_type) and not lowered_name.startswith("_"):
+                score = 0
+                if lowered_name in {"orders", "order_count", "total_sales", "sales", "revenue"}:
+                    score += 4
+                if lowered_name in query_tokens:
+                    score += 3
+                if any(token in lowered_name for token in query_tokens):
+                    score += 1
+                scored_targets.append((score, name))
+        if scored_targets:
+            scored_targets.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
+            target_column = scored_targets[0][1]
+        if date_column and target_column:
+            return table_name, date_column, target_column
+        if date_column and not target_column:
+            # Date present but no numeric target is still a "missing target" failure.
+            return table_name, date_column, ""
+
+    if candidates:
+        # Date column missing on the only/bound dataset: communicate this as
+        # missing_time_column so the orchestrator can render a precise message.
+        table_name = candidates[0][0]
+        return table_name, "", ""
+    return "", "", ""
 
 
 def _utc_now() -> str:
@@ -138,6 +242,28 @@ _BUSINESS_TERM_NORMALIZATION = {
     "influence": "relationship",
     "relation": "relationship",
 }
+
+_TIME_SEMANTICS_IN_PHRASE = re.compile(
+    r"\bover\s+time\b|\btrend(s)?\b|\bby\s+date\b|\bby\s+day\b|\bdaily\b|\bweekly\b|\bmonthly\b|\bquarterly\b"
+    r"|\b(per|by)\s+(day|week|month|quarter|year)\b|\bper\s+day\b|\bper\s+week\b|\bper\s+month\b|\bper\s+quarter\b|\bper\s+year\b",
+    re.I,
+)
+
+_PROTECTED_SCHEMA_FUZZY_TOKENS = frozenset(
+    {"time", "daily", "weekly", "monthly", "quarterly", "yearly", "trend", "trends", "annual", "annually"}
+)
+
+
+def _attach_intent_query_metadata(payload: dict[str, object], *, original_text: str, final_text: str) -> None:
+    orig = str(original_text or "").strip()
+    fin = str(final_text or "").strip()
+    payload["original_query_for_intent"] = orig
+    if question_requests_analytical_time(orig) and not question_requests_analytical_time(fin):
+        payload["time_semantics_detected"] = True
+        payload["time_phrase"] = extract_longest_time_keyword(orig) or "time_series"
+    else:
+        payload.setdefault("time_semantics_detected", False)
+        payload.setdefault("time_phrase", "")
 
 
 def _schema_token_vocabulary(loaded_schema) -> set[str]:
@@ -264,6 +390,8 @@ def _apply_fuzzy_phrase_corrections(
                 continue
             if all(token.lower() in _SCHEMA_CORRECTION_STOP_WORDS for token in phrase_tokens):
                 continue
+            if _TIME_SEMANTICS_IN_PHRASE.search(f" {candidate_phrase} "):
+                continue
 
             best_phrase, _ = _best_fuzzy_candidate(candidate_phrase, phrase_candidates)
             if not best_phrase:
@@ -326,6 +454,7 @@ def _apply_fuzzy_token_corrections(
             or lower in vocabulary
             or lower in _SCHEMA_CORRECTION_STOP_WORDS
             or lower in _BUSINESS_TERM_NORMALIZATION
+            or lower in _PROTECTED_SCHEMA_FUZZY_TOKENS
         ):
             continue
         if targets and lower not in targets:
@@ -451,6 +580,24 @@ def _filter_resolved_diagnostics(
     return filtered
 
 
+def _should_skip_llm_schema_validation(
+    *,
+    deterministic_validation_result: dict[str, object],
+    deterministic_diagnostics: dict[str, object],
+    dataset_scope: dict[str, object] | None,
+    config: HighPreprocessConfig,
+) -> bool:
+    if not config.enable_llm_schema_validation:
+        return True
+    if str((dataset_scope or {}).get("table_name", "")).strip():
+        return True
+    if not bool(deterministic_validation_result.get("is_valid", False)):
+        return False
+    unresolved = [str(term).strip() for term in deterministic_diagnostics.get("unresolved_terms", []) if str(term).strip()]
+    unsupported = [str(term).strip() for term in deterministic_diagnostics.get("unsupported_terms", []) if str(term).strip()]
+    return not unresolved and not unsupported
+
+
 def run_preprocess_high(
     cleaned_text: str,
     user_id: str,
@@ -487,6 +634,7 @@ def run_preprocess_high(
             user_friendly_messages: list[str] = []
 
             skipped_schema_terms: list[str] = []
+            forecast_resolution: dict[str, str] = {}
             if normalized_route == "forecasting":
                 # Forecasting control words (e.g., "next 7 days") are not schema entities.
                 # Preserve the cleaned query as-is to avoid accidental column rewrites.
@@ -500,6 +648,38 @@ def run_preprocess_high(
                 validation_result["is_valid"] = True
                 validation_result["missing_column"] = ""
                 validation_result["invalid_mappings"] = []
+
+                # Phase 5 / CRIT-14: forecasting MUST run schema validation.
+                # We resolve forecast_date_column / forecast_target_column from
+                # the loaded schema and reject the request with a stable error
+                # code when the dataset is incompatible with forecasting.
+                forecast_table, forecast_date_column, forecast_target_column = _resolve_forecast_columns(
+                    loaded_schema=loaded_schema,
+                    dataset_scope=dataset_scope,
+                    query_text=normalized_text,
+                )
+                if not forecast_date_column:
+                    raise PreprocessHighMissingColumnError(
+                        missing_column=FORECAST_MISSING_TIME_COLUMN,
+                        message=(
+                            "Forecasting requires a Date/DateTime column, but the selected dataset "
+                            f"'{forecast_table or 'workspace'}' does not expose one. "
+                            "Add a time column to the dataset or change the question."
+                        ),
+                    )
+                if not forecast_target_column:
+                    raise PreprocessHighMissingColumnError(
+                        missing_column=FORECAST_MISSING_TARGET_COLUMN,
+                        message=(
+                            "Forecasting requires a numeric target column (e.g. revenue, sales, count), "
+                            f"but the selected dataset '{forecast_table}' does not expose one."
+                        ),
+                    )
+                forecast_resolution = {
+                    "forecast_table": forecast_table,
+                    "forecast_date_column": forecast_date_column,
+                    "forecast_target_column": forecast_target_column,
+                }
             else:
                 pre_corrected_query, phrase_corrections = _apply_fuzzy_phrase_corrections(
                     query=normalized_text,
@@ -513,21 +693,44 @@ def run_preprocess_high(
                 pre_corrected_query, semantic_corrections = _apply_business_term_normalization(pre_corrected_query)
                 term_corrections.extend(fuzzy_corrections)
                 term_corrections.extend(semantic_corrections)
-
-                final_query = correct_query_terms(
-                    query=pre_corrected_query,
-                    loaded_schema=loaded_schema,
-                    config=config,
-                    logger=logger,
-                    log_event=_log_event,
-                )
-                validation_result = validate_query_schema_usage(
+                final_query = pre_corrected_query
+                validation_result = build_deterministic_schema_validation_result(
                     corrected_query=final_query,
                     loaded_schema=loaded_schema,
-                    config=config,
-                    logger=logger,
-                    log_event=_log_event,
                 )
+                deterministic_diagnostics = build_schema_resolution_diagnostics(
+                    original_query=normalized_text,
+                    corrected_query=final_query,
+                    loaded_schema=loaded_schema,
+                    validation_result=validation_result,
+                    ignored_terms=set(skipped_schema_terms),
+                )
+                if not _should_skip_llm_schema_validation(
+                    deterministic_validation_result=validation_result,
+                    deterministic_diagnostics=deterministic_diagnostics,
+                    dataset_scope=dataset_scope,
+                    config=config,
+                ):
+                    llm_config = HighPreprocessConfig(
+                        **{
+                            **config.__dict__,
+                            "request_timeout_seconds": config.llm_schema_validation_timeout_seconds,
+                        }
+                    )
+                    final_query = correct_query_terms(
+                        query=pre_corrected_query,
+                        loaded_schema=loaded_schema,
+                        config=llm_config,
+                        logger=logger,
+                        log_event=_log_event,
+                    )
+                    validation_result = validate_query_schema_usage(
+                        corrected_query=final_query,
+                        loaded_schema=loaded_schema,
+                        config=llm_config,
+                        logger=logger,
+                        log_event=_log_event,
+                    )
 
             diagnostics = build_schema_resolution_diagnostics(
                 original_query=normalized_text,
@@ -597,13 +800,31 @@ def run_preprocess_high(
 
                     final_query = recovery_query
                     # Recovery pass: rerun schema-aware validation on the corrected query.
-                    validation_result = validate_query_schema_usage(
-                        corrected_query=final_query,
-                        loaded_schema=loaded_schema,
+                    if _should_skip_llm_schema_validation(
+                        deterministic_validation_result=validation_result,
+                        deterministic_diagnostics=diagnostics,
+                        dataset_scope=dataset_scope,
                         config=config,
-                        logger=logger,
-                        log_event=_log_event,
-                    )
+                    ):
+                        validation_result = build_deterministic_schema_validation_result(
+                            corrected_query=final_query,
+                            loaded_schema=loaded_schema,
+                            ignored_terms=set(skipped_schema_terms),
+                        )
+                    else:
+                        llm_config = HighPreprocessConfig(
+                            **{
+                                **config.__dict__,
+                                "request_timeout_seconds": config.llm_schema_validation_timeout_seconds,
+                            }
+                        )
+                        validation_result = validate_query_schema_usage(
+                            corrected_query=final_query,
+                            loaded_schema=loaded_schema,
+                            config=llm_config,
+                            logger=logger,
+                            log_event=_log_event,
+                        )
                     diagnostics = build_schema_resolution_diagnostics(
                         original_query=normalized_text,
                         corrected_query=final_query,
@@ -749,6 +970,13 @@ def run_preprocess_high(
             }
             success_payload["route"] = normalized_route
             success_payload["skipped_schema_terms"] = skipped_schema_terms
+            if forecast_resolution:
+                success_payload["forecast_table"] = forecast_resolution.get("forecast_table", "")
+                success_payload["forecast_date_column"] = forecast_resolution.get("forecast_date_column", "")
+                success_payload["forecast_target_column"] = forecast_resolution.get(
+                    "forecast_target_column", ""
+                )
+            _attach_intent_query_metadata(success_payload, original_text=normalized_text, final_text=final_query)
             success_payload["confidence"] = schema_confidence(success_payload)
             return success_payload
         except PreprocessHighMissingColumnError as exc:
@@ -921,6 +1149,11 @@ def run_preprocess_high(
                     success_payload["status"] = "degraded"
                     success_payload["degraded"] = True
                     success_payload["degradation_reason"] = "schema_validation_llm_fallback"
+                    _attach_intent_query_metadata(
+                        success_payload,
+                        original_text=str(cleaned_text or "").strip(),
+                        final_text=fallback_query,
+                    )
                     success_payload["confidence"] = schema_confidence(success_payload)
                     _log_event(
                         logger,

@@ -1,7 +1,20 @@
-﻿from __future__ import annotations
+﻿"""Input classifier (Phase 4 / CRIT-06).
+
+The legacy implementation kept its own ``_FORECAST_PATTERNS`` table which was
+the fourth duplicate copy of predictive detection across the codebase. Phase 4
+of the audit demands that **all** predictive heuristics live in
+``bi_platform_shared.predictive.detector.is_predictive`` so drift is no longer
+possible. This module now consults the shared detector for the forecast
+short-circuit and keeps only the conversational / analytical heuristics that
+remain genuinely local to the input classifier.
+"""
+
+from __future__ import annotations
 
 import re
 from typing import Any
+
+from bi_platform_shared.predictive.detector import is_predictive
 
 
 _CONVERSATIONAL_PATTERNS = (
@@ -14,25 +27,6 @@ _CONVERSATIONAL_PATTERNS = (
     r"\bwho are you\b",
     r"\bwhat can you do\b",
     r"\bgood (morning|afternoon|evening)\b",
-)
-
-_FORECAST_PATTERNS = (
-    r"\bforecast\b",
-    r"\bpredict\b",
-    r"\bprediction\b",
-    r"\bproject(?:ed|ion)?\b",
-    r"\bexpected\b",
-    r"\bfuture\b",
-    r"\bupcoming\b",
-    r"\bfor\s+the\s+next\b",
-    r"\bin\s+the\s+next\b",
-    r"\bover\s+the\s+next\b",
-    r"\bnext\s+(week|month|quarter|year)\b",
-    r"\bnext\s+\d+\s+(day|days|week|weeks|month|months|year|years)\b",
-    r"\b(?:for|in|over)\s+the\s+next\s+\d+\s+(day|days|week|weeks|month|months|year|years)\b",
-    r"\bwhat\s+will\s+be\b",
-    r"\btrend\b.*\b(next|future|upcoming|forecast|predict)\b",
-    r"\b(next|future|upcoming|forecast|predict)\b.*\btrend\b",
 )
 
 _ANALYTICAL_HINTS = (
@@ -67,6 +61,9 @@ _ANALYTICAL_HINTS = (
     "revenue",
     "profit",
     "margin",
+    "cumulative",
+    "accumulated",
+    "running total",
 )
 
 
@@ -75,11 +72,12 @@ def _normalize_text(value: Any) -> str:
 
 
 def _contains_hint(text: str, hint: str) -> bool:
+    normalized_text = re.sub(r"[_-]+", " ", str(text or "").lower())
     normalized_hint = str(hint or "").strip().lower()
     if not normalized_hint:
         return False
     pattern = r"\b" + re.escape(normalized_hint).replace(r"\ ", r"\s+") + r"\b"
-    return bool(re.search(pattern, text))
+    return bool(re.search(pattern, normalized_text))
 
 
 def _is_punctuation_only(text: str) -> bool:
@@ -264,7 +262,7 @@ def classify_input(
             "flags": ["non_analytical"],
         }
 
-    if any(re.search(pattern, lowered) for pattern in _FORECAST_PATTERNS):
+    if is_predictive(cleaned):
         return {
             "classification": "forecast",
             "confidence": 0.9,

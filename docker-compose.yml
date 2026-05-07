@@ -1,7 +1,8 @@
 services:
   api-gateway:
     build:
-      context: ./services/api-gateway
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
     container_name: api-gateway
     ports:
       - "8000:8000"
@@ -42,7 +43,8 @@ services:
 
   auth-service:
     build:
-      context: ./services/auth-service
+      context: .
+      dockerfile: services/auth-service/Dockerfile
     container_name: auth-service
     ports:
       - "8001:8001"
@@ -61,7 +63,8 @@ services:
 
   workspace-service:
     build:
-      context: ./services/workspace-service
+      context: .
+      dockerfile: services/workspace-service/Dockerfile
     container_name: workspace-service
     ports:
       - "8002:8002"
@@ -83,7 +86,8 @@ services:
 
   report-service:
     build:
-      context: ./services/report-service
+      context: .
+      dockerfile: services/report-service/Dockerfile
     container_name: report-service
     ports:
       - "8003:8003"
@@ -113,13 +117,15 @@ services:
 
   voice-service:
     build:
-      context: ./services/voice-service
+      context: .
+      dockerfile: services/voice-service/Dockerfile
     container_name: voice-service
     ports:
       - "8004:8004"
     env_file:
       - ./.env.microservices
     volumes:
+      - voice_service_media:/app/media
       - "C:/Users/massa/.cache/huggingface/hub/models--google--timesfm-2.5-200m-pytorch/snapshots/1d952420fba87f3c6dee4f240de0f1a0fbc790e3:/models/timesfm"
     environment:
       SMALL_WHISPER_URL: http://ai-service:8005
@@ -132,7 +138,18 @@ services:
       SUBSCRIPTION_SERVICE_URL: ${SUBSCRIPTION_SERVICE_URL:-http://subscription-service:8008}
       CLICKHOUSE_HOST: clickhouse
       CLICKHOUSE_PORT: "8123"
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092,host.docker.internal:29092
+      # CRIT-02 async pipeline (Celery + Redis)
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/1}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/2}
+      CELERY_TASK_ALWAYS_EAGER: ${CELERY_TASK_ALWAYS_EAGER:-false}
+      # CRIT-11 audio validation hardening
+      CLAMAV_HOST: clamav
+      CLAMAV_PORT: "3310"
+      CLAMAV_REQUIRED: ${CLAMAV_REQUIRED:-true}
+      AUDIO_FFPROBE_REQUIRED: ${AUDIO_FFPROBE_REQUIRED:-true}
+      AUDIO_MAX_SIZE_BYTES: ${AUDIO_MAX_SIZE_BYTES:-104857600}
+      AUDIO_MAX_DURATION_SECONDS: ${AUDIO_MAX_DURATION_SECONDS:-300}
     depends_on:
       ai-service:
         condition: service_healthy
@@ -145,6 +162,10 @@ services:
       clickhouse:
         condition: service_started
       kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clamav:
         condition: service_started
     healthcheck:
       test:
@@ -157,9 +178,68 @@ services:
       retries: 20
       start_period: 20s
 
+  voice-service-worker:
+    # CRIT-02 — Celery worker that consumes voice_pipeline tasks dispatched by
+    # the voice-service web container. Sharing the image keeps the code base
+    # identical between web and worker.
+    build:
+      context: .
+      dockerfile: services/voice-service/Dockerfile
+    container_name: voice-service-worker
+    env_file:
+      - ./.env.microservices
+    environment:
+      DJANGO_SETTINGS_MODULE: service_config.settings
+      PYTHONPATH: /app
+      SMALL_WHISPER_URL: http://ai-service:8005
+      QUERY_SERVICE_URL: ${QUERY_SERVICE_URL:-http://query-service:8006}
+      VISUALIZATION_SERVICE_URL: ${VISUALIZATION_SERVICE_URL:-http://visualization-service:8007}
+      SUBSCRIPTION_SERVICE_URL: ${SUBSCRIPTION_SERVICE_URL:-http://subscription-service:8008}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "8123"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092,host.docker.internal:29092
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/1}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/2}
+      CELERY_WORKER_CONCURRENCY: ${CELERY_WORKER_CONCURRENCY:-4}
+      CLAMAV_HOST: clamav
+      CLAMAV_PORT: "3310"
+    command:
+      - sh
+      - -c
+      - >
+        python manage.py migrate &&
+        celery -A service_config worker
+        -Q voice_pipeline
+        --loglevel=info
+        --concurrency=${CELERY_WORKER_CONCURRENCY:-4}
+        --max-tasks-per-child=50
+    volumes:
+      - voice_service_media:/app/media
+      - "C:/Users/massa/.cache/huggingface/hub/models--google--timesfm-2.5-200m-pytorch/snapshots/1d952420fba87f3c6dee4f240de0f1a0fbc790e3:/models/timesfm"
+    depends_on:
+      voice-service:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ai-service:
+        condition: service_healthy
+      query-service:
+        condition: service_healthy
+      visualization-service:
+        condition: service_healthy
+      clamav:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "celery", "-A", "service_config", "inspect", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
   ai-service:
     build:
-      context: ./services/ai-service
+      context: .
+      dockerfile: services/ai-service/Dockerfile
     container_name: ai-service
     ports:
       - "8005:8005"
@@ -179,6 +259,13 @@ services:
       TRANSCRIPTION_REDIS_URL: ${TRANSCRIPTION_REDIS_URL:-redis://redis:6379/0}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemma-3n-e4b-it:free}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      OPENROUTER_SITE_URL: ${OPENROUTER_SITE_URL:-http://localhost}
+      OPENROUTER_APP_NAME: ${OPENROUTER_APP_NAME:-BI Voice Agent}
+      ENABLE_LLM_SCHEMA_VALIDATION: ${ENABLE_LLM_SCHEMA_VALIDATION:-false}
+      OLLAMA_SCHEMA_VALIDATION_TIMEOUT: ${OLLAMA_SCHEMA_VALIDATION_TIMEOUT:-90}
+      OLLAMA_SCHEMA_VALIDATION_MAX_RETRIES: ${OLLAMA_SCHEMA_VALIDATION_MAX_RETRIES:-1}
+      QUERY_SERVICE_URL: ${QUERY_SERVICE_URL:-http://query-service:8006}
     depends_on:
       - clickhouse
       - redis
@@ -210,7 +297,8 @@ services:
 
   query-service:
     build:
-      context: ./services/query-service
+      context: .
+      dockerfile: services/query-service/Dockerfile
     container_name: query-service
     ports:
       - "8006:8006"
@@ -219,14 +307,14 @@ services:
     environment:
       CLICKHOUSE_HOST: clickhouse
       CLICKHOUSE_PORT: "8123"
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092,host.docker.internal:29092
       ETL_SERVICE_URL: ${ETL_SERVICE_URL:-http://etl-connector:8000}
       METADATA_SERVICE_URL: ${METADATA_SERVICE_URL:-http://etl-metadata:8000}
     depends_on:
       clickhouse:
         condition: service_started
       kafka:
-        condition: service_started
+        condition: service_healthy
       etl-connector:
         condition: service_started
       etl-metadata:
@@ -246,15 +334,13 @@ services:
 
   visualization-service:
     build:
-      context: ./services/visualization-service
+      context: .
+      dockerfile: services/visualization-service/Dockerfile
     container_name: visualization-service
     ports:
       - "8007:8007"
     env_file:
       - ./.env.microservices
-    depends_on:
-      report-service:
-        condition: service_healthy
     healthcheck:
       test:
         - CMD
@@ -268,10 +354,11 @@ services:
 
   subscription-service:
     build:
-      context: ./services/subscription-service
+      context: .
+      dockerfile: services/subscription-service/Dockerfile
     container_name: subscription-service
     ports:
-      - "8009:8008"
+      - "8011:8008"
     env_file:
       - ./.env.microservices
     depends_on:
@@ -332,6 +419,7 @@ services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     container_name: zookeeper
+    restart: unless-stopped
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
@@ -341,29 +429,42 @@ services:
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: kafka
+    restart: unless-stopped
     depends_on:
       - zookeeper
     ports:
       - "9092:9092"
+      - "29092:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://host.docker.internal:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - kafka-broker-api-versions --bootstrap-server localhost:9092 > /dev/null 2>&1
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
+    restart: unless-stopped
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     ports:
       - "8081:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: local
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092,host.docker.internal:29092
 
   surrealdb:
     image: surrealdb/surrealdb:latest
@@ -409,13 +510,14 @@ services:
       context: ./etl-final
       dockerfile: connector-service/Dockerfile
     container_name: etl-connector
+    restart: unless-stopped
     ports:
       - "8101:8000"
     volumes:
       - uploaded-files:/app/uploaded_files
     environment:
       PYTHONPATH: /app
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092,host.docker.internal:29092
       KAFKA_ENABLE_TOPIC_ALIASING: "true"
       KAFKA_REQUIRED_TOPICS: raw_data,transformed_data,load_requests,metadata_updates,errors,quarantine,connection_topic,schema_topic,extracted_rows_topic,clean_rows_topic,load_rows_topic,metadata_topic,extracted_rows_dlq,clean_rows_dlq,load_rows_dlq
       CLICKHOUSE_HOST: clickhouse
@@ -434,21 +536,26 @@ services:
       CLAMAV_PORT: "3310"
       CLAMAV_TIMEOUT: "30"
     depends_on:
-      - kafka
-      - surrealdb
-      - clickhouse
-      - clamav
+      kafka:
+        condition: service_healthy
+      surrealdb:
+        condition: service_started
+      clickhouse:
+        condition: service_started
+      clamav:
+        condition: service_started
 
   etl-detector:
     build:
       context: ./etl-final
       dockerfile: detector-service/Dockerfile
     container_name: etl-detector
+    restart: unless-stopped
     ports:
       - "8102:8000"
     environment:
       PYTHONPATH: /app
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092,host.docker.internal:29092
       KAFKA_ENABLE_TOPIC_ALIASING: "true"
       KAFKA_REQUIRED_TOPICS: raw_data,transformed_data,load_requests,metadata_updates,errors,quarantine,connection_topic,schema_topic,extracted_rows_topic,clean_rows_topic,load_rows_topic,metadata_topic,extracted_rows_dlq,clean_rows_dlq,load_rows_dlq
       CLICKHOUSE_HOST: clickhouse
@@ -462,22 +569,26 @@ services:
       SURREAL_NS: bi_etl
       SURREAL_DB: etl_logs
     depends_on:
-      - kafka
-      - surrealdb
-      - clickhouse
+      kafka:
+        condition: service_healthy
+      surrealdb:
+        condition: service_started
+      clickhouse:
+        condition: service_started
 
   etl-extractor:
     build:
       context: ./etl-final
       dockerfile: extractor-service/Dockerfile
     container_name: etl-extractor
+    restart: unless-stopped
     ports:
       - "8103:8000"
     volumes:
       - uploaded-files:/app/uploaded_files
     environment:
       PYTHONPATH: /app
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092,host.docker.internal:29092
       KAFKA_ENABLE_TOPIC_ALIASING: "true"
       KAFKA_REQUIRED_TOPICS: raw_data,transformed_data,load_requests,metadata_updates,errors,quarantine,connection_topic,schema_topic,extracted_rows_topic,clean_rows_topic,load_rows_topic,metadata_topic,extracted_rows_dlq,clean_rows_dlq,load_rows_dlq
       EXTRACTOR_DLQ_TOPIC: errors
@@ -492,20 +603,24 @@ services:
       SURREAL_NS: bi_etl
       SURREAL_DB: etl_logs
     depends_on:
-      - kafka
-      - surrealdb
-      - clickhouse
+      kafka:
+        condition: service_healthy
+      surrealdb:
+        condition: service_started
+      clickhouse:
+        condition: service_started
 
   etl-transformer:
     build:
       context: ./etl-final
       dockerfile: transformer-service/Dockerfile
     container_name: etl-transformer
+    restart: unless-stopped
     ports:
       - "8104:8000"
     environment:
       PYTHONPATH: /app
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092,host.docker.internal:29092
       KAFKA_ENABLE_TOPIC_ALIASING: "true"
       KAFKA_REQUIRED_TOPICS: raw_data,transformed_data,load_requests,metadata_updates,errors,quarantine,connection_topic,schema_topic,extracted_rows_topic,clean_rows_topic,load_rows_topic,metadata_topic,extracted_rows_dlq,clean_rows_dlq,load_rows_dlq
       TRANSFORMER_DLQ_TOPIC: errors
@@ -520,20 +635,24 @@ services:
       SURREAL_NS: bi_etl
       SURREAL_DB: etl_logs
     depends_on:
-      - kafka
-      - surrealdb
-      - clickhouse
+      kafka:
+        condition: service_healthy
+      surrealdb:
+        condition: service_started
+      clickhouse:
+        condition: service_started
 
   etl-loader:
     build:
       context: ./etl-final
       dockerfile: loader-service/Dockerfile
     container_name: etl-loader
+    restart: unless-stopped
     ports:
       - "8105:8000"
     environment:
       PYTHONPATH: /app
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092,host.docker.internal:29092
       KAFKA_ENABLE_TOPIC_ALIASING: "true"
       KAFKA_REQUIRED_TOPICS: raw_data,transformed_data,load_requests,metadata_updates,errors,quarantine,connection_topic,schema_topic,extracted_rows_topic,clean_rows_topic,load_rows_topic,metadata_topic,extracted_rows_dlq,clean_rows_dlq,load_rows_dlq
       LOADER_DLQ_TOPIC: errors
@@ -548,20 +667,24 @@ services:
       SURREAL_NS: bi_etl
       SURREAL_DB: etl_logs
     depends_on:
-      - kafka
-      - clickhouse
-      - surrealdb
+      kafka:
+        condition: service_healthy
+      clickhouse:
+        condition: service_started
+      surrealdb:
+        condition: service_started
 
   etl-metadata:
     build:
       context: ./etl-final
       dockerfile: metadata-service/Dockerfile
     container_name: etl-metadata
+    restart: unless-stopped
     ports:
       - "8106:8000"
     environment:
       PYTHONPATH: /app
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092,host.docker.internal:29092
       KAFKA_ENABLE_TOPIC_ALIASING: "true"
       KAFKA_REQUIRED_TOPICS: raw_data,transformed_data,load_requests,metadata_updates,errors,quarantine,connection_topic,schema_topic,extracted_rows_topic,clean_rows_topic,load_rows_topic,metadata_topic,extracted_rows_dlq,clean_rows_dlq,load_rows_dlq
       SURREAL_URL: http://surrealdb:8000/sql
@@ -570,10 +693,13 @@ services:
       SURREAL_NS: bi_etl
       SURREAL_DB: etl_logs
     depends_on:
-      - kafka
-      - surrealdb
+      kafka:
+        condition: service_healthy
+      surrealdb:
+        condition: service_started
 
 volumes:
+  voice_service_media:
   uploaded-files:
   surreal_data:
   clickhouse_data:

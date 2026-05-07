@@ -18,6 +18,7 @@ requests==2.31.0
 
 # ClickHouse HTTP Client (for query execution)
 clickhouse-connect
+sqlglot>=25.17.0
 
 # Python dotenv for environment variables
 python-dotenv==1.0.0

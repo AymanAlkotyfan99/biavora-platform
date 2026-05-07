@@ -6,7 +6,12 @@ from dagster import AssetExecutionContext, asset
 from dagster_pipeline import ASSET_RETRY_POLICY, pipeline_failure_hook
 from intent_extraction.intent_extraction_task import run_intent_extraction_stage
 from llm_app.schema_provider import get_schema_for_dataset
-from shared.dataset_binding import DatasetBindingError, normalize_dataset_context, validate_dataset_context
+from shared.dataset_binding import (
+    DatasetBindingError,
+    normalize_dataset_context,
+    normalize_identifier,
+    validate_dataset_context,
+)
 from shared.confidence import stage_confidence
 from shared.pipeline_trace import make_attempt, utc_now_iso
 from shared.pipeline_guards import dataset_scope_guard
@@ -53,7 +58,18 @@ def _bound_table_schema_or_error(
     schema_snapshot: dict[str, list[dict[str, Any]]],
     dataset_context: dict[str, str],
 ) -> dict[str, list[dict[str, Any]]]:
-    bound_table = str(dataset_context.get("table_name", "")).strip()
+    bound_table = normalize_identifier(dataset_context.get("table_name", ""))
+    if not bound_table:
+        if len(schema_snapshot) == 1:
+            table_name = next(iter(schema_snapshot.keys()))
+            return {table_name: schema_snapshot[table_name]}
+        if schema_snapshot:
+            selected = sorted(schema_snapshot.keys())[0]
+            return {selected: schema_snapshot[selected]}
+        raise DatasetBindingError(
+            "Dataset-table mismatch: empty schema snapshot after preprocessing_high (no tables; "
+            "check ClickHouse connectivity and PREPROCESS_HIGH database template)."
+        )
     normalized_bound_suffix = bound_table.split(".")[-1].lower()
     for table_name, columns in schema_snapshot.items():
         normalized_table = str(table_name).strip()
@@ -64,7 +80,12 @@ def _bound_table_schema_or_error(
             or normalized_table.split(".")[-1].lower() == normalized_bound_suffix
         ):
             return {normalized_table: columns}
-    raise DatasetBindingError("Dataset-table mismatch: invalid ETL binding")
+    preview = list(schema_snapshot.keys())[:25]
+    raise DatasetBindingError(
+        "Dataset-table mismatch: bound table_name "
+        f"{bound_table!r} (suffix={normalized_bound_suffix!r}) not found in preprocessing schema "
+        f"(available_tables={preview!r})"
+    )
 
 
 @asset(
@@ -80,10 +101,11 @@ def intent_extraction_asset(
     stage_started_perf = time.perf_counter()
     high_status = preprocessing_high_asset.get("status")
     if not stage_allows_progress(high_status, degraded=bool(preprocessing_high_asset.get("degraded"))):
-        context.log.warning(
-            "Skipping intent extraction because high preprocessing did not succeed | status=%s",
-            high_status,
+        message = str(
+            preprocessing_high_asset.get("message")
+            or "Intent extraction skipped because preprocessing/classification did not allow progress."
         )
+        context.log.warning("Intent extraction stopped by upstream gate | status=%s message=%s", high_status, message)
         attempts = [
             make_attempt(
                 attempt_number=1,
@@ -91,37 +113,42 @@ def intent_extraction_asset(
                 output_payload={},
                 success=False,
                 retry_triggered=False,
-                model_or_method_used="upstream_guard",
+                model_or_method_used="upstream_stage_guard",
                 duration_ms=0,
                 validation_result={"is_valid": False},
-                error_type="upstream_preprocessing_high_failed",
-                error_message="Intent extraction skipped due to preprocessing_high status.",
+                error_type="upstream_rejected",
+                error_message=message,
             )
         ]
         return {
             "status": "skipped",
-            "intent_type": "analytical",
-            "next_step": "metabase",
-            "error_type": "upstream_preprocessing_high_failed",
+            "intent_type": "invalid",
+            "next_step": "stop",
+            "error_type": "upstream_rejected",
             "action_taken": "stop",
+            "message": message,
+            "query": "",
+            "schema": {},
+            "extracted_intent": {},
+            "validated_intent": {},
             "attempts": attempts,
             "attempts_count": len(attempts),
             "started_at": stage_started_at,
             "finished_at": utc_now_iso(),
             "duration_ms": int((time.perf_counter() - stage_started_perf) * 1000),
             "warnings": [],
-            "errors": [
-                {
-                    "type": "upstream_preprocessing_high_failed",
-                    "message": "Intent extraction skipped due to preprocessing_high status.",
-                }
-            ],
-            "debug_metadata": {},
+            "errors": [{"type": "upstream_rejected", "message": message}],
+            "debug_metadata": {
+                "upstream_status": high_status,
+                "upstream_stage": "preprocessing_high",
+            },
+            "upstream_status": high_status,
+            "upstream_stage": "preprocessing_high",
         }
 
     final_query = str(preprocessing_high_asset.get("final_query", "")).strip()
     if not final_query:
-        context.log.error("Intent extraction input invalid: final_query is empty after high preprocessing.")
+        message = "Intent extraction requires a non-empty normalized question."
         attempts = [
             make_attempt(
                 attempt_number=1,
@@ -129,28 +156,32 @@ def intent_extraction_asset(
                 output_payload={},
                 success=False,
                 retry_triggered=False,
-                model_or_method_used="input_validation",
+                model_or_method_used="intent_extraction_input_guard",
                 duration_ms=0,
                 validation_result={"is_valid": False},
                 error_type="input",
-                error_message="final_query is empty after high preprocessing.",
+                error_message=message,
             )
         ]
         return {
             "status": "failed",
-            "intent_type": "analytical",
-            "next_step": "metabase",
+            "intent_type": "invalid",
+            "next_step": "stop",
             "error_type": "input",
             "action_taken": "stop",
+            "message": message,
+            "query": "",
+            "schema": {},
+            "extracted_intent": {},
+            "validated_intent": {},
             "attempts": attempts,
             "attempts_count": len(attempts),
             "started_at": stage_started_at,
             "finished_at": utc_now_iso(),
             "duration_ms": int((time.perf_counter() - stage_started_perf) * 1000),
             "warnings": [],
-            "errors": [{"type": "input", "message": "final_query is empty after high preprocessing."}],
+            "errors": [{"type": "input", "message": message}],
             "debug_metadata": {},
-            "confidence": 0.0,
         }
 
     route = str(
@@ -179,40 +210,8 @@ def intent_extraction_asset(
     )
     try:
         dataset_context = validate_dataset_context(normalize_dataset_context(dataset_scope))
-    except DatasetBindingError as exc:
-        attempts = [
-            make_attempt(
-                attempt_number=1,
-                input_payload={"dataset_scope": dataset_scope},
-                output_payload={},
-                success=False,
-                retry_triggered=False,
-                model_or_method_used="dataset_binding_validator",
-                duration_ms=0,
-                validation_result={"is_valid": False},
-                error_type="input",
-                error_message=str(exc),
-            )
-        ]
-        return {
-            "status": "failed",
-            "intent_type": "analytical",
-            "next_step": "metabase",
-            "error_type": "input",
-            "action_taken": "stop",
-            "message": str(exc),
-            "attempts": attempts,
-            "attempts_count": len(attempts),
-            "started_at": stage_started_at,
-            "finished_at": utc_now_iso(),
-            "duration_ms": int((time.perf_counter() - stage_started_perf) * 1000),
-            "warnings": [],
-            "errors": [{"type": "input", "message": str(exc)}],
-            "debug_metadata": {
-                "dataset_scope": normalize_dataset_context(dataset_scope),
-                "reason_for_selection": "missing_dataset_binding",
-            },
-        }
+    except DatasetBindingError:
+        dataset_context = normalize_dataset_context(dataset_scope)
 
     schema_snapshot = _schema_from_preprocessing_high(preprocessing_high_asset)
     schema_source = "preprocessing_high.schema_used"
@@ -326,10 +325,25 @@ def intent_extraction_asset(
     schema_snapshot = scoped_schema
     should_scope_schema = True
 
+    original_user_question = str(
+        preprocessing_high_asset.get("original_query_for_intent")
+        or (
+            (preprocessing_high_asset.get("routing") or {}).get("payload", {}).get("cleaned_text")
+            if isinstance(preprocessing_high_asset.get("routing"), dict)
+            else ""
+        )
+        or final_query
+    ).strip()
     result = run_intent_extraction_stage(
         query=final_query,
         schema=schema_snapshot,
         route=route,
+        preprocess_hints={
+            "selected_columns": selected_columns,
+            "selected_table": bound_table,
+            "original_user_question": original_user_question,
+            "original_query_for_intent": original_user_question,
+        },
     )
     result.setdefault("started_at", stage_started_at)
     result.setdefault("finished_at", utc_now_iso())

@@ -90,6 +90,45 @@ class AITraceServiceTests(unittest.TestCase):
 
         self.assertFalse(bool(trace["classification"]["error"]))
 
+    def test_forecasting_horizon_parses_numeric_hint_without_raising(self):
+        trace = build_ai_trace_payload(
+            report_id=12,
+            transcription="Forecast total sales for next 7 days",
+            preprocessing_low={"cleaned_text": "Forecast total sales for next 7 days"},
+            preprocessing_high={},
+            intent_json={"question_type": "predictive"},
+            pipeline_trace={
+                "classification": {"status": "success", "final_output": {"question_type": "predictive"}},
+                "forecasting": {"status": "success", "final_output": {}},
+            },
+            generated_sql="SELECT ds, total_sales FROM etl.sales",
+            reviewed_sql="SELECT ds, total_sales FROM etl.sales",
+            query_result={
+                "columns": ["ds", "value", "series_type"],
+                "rows": [
+                    {"ds": "2026-05-01", "value": 100.0, "series_type": "actual"},
+                    {"ds": "2026-05-02", "value": 110.0, "series_type": "forecast"},
+                ],
+            },
+            execution_time_ms=10,
+            row_count=2,
+            chart_type="line_multi",
+            metabase_question_id=3,
+            metabase_dashboard_id=4,
+            embed_url="",
+            chart_config={
+                "forecasting": {
+                    "status": "success",
+                    "request": {"requires_forecast": True, "horizon": "next 7 days"},
+                    "meta": {"time_column": "ds", "value_column": "total_sales"},
+                }
+            },
+            error_message="",
+        )
+
+        self.assertIn("forecasting", trace)
+        self.assertEqual(trace["forecasting"]["horizon"], 7)
+
 
 if __name__ == "__main__":
     unittest.main()

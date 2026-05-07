@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link, useSearchParams, useNavigate } from 'react-router-dom'
 import { CheckCircle, XCircle, Mail, Loader2 } from 'lucide-react'
 import { authAPI } from '../../api/endpoints'
-import toast from 'react-hot-toast'
+import { toast } from 'react-toastify'
 import Button from '../../components/Button'
 
 function VerifyEmail() {

@@ -109,6 +109,21 @@ class PreprocessHighRecoveryTests(unittest.TestCase):
         self.assertNotIn("highest", diagnostics.get("unresolved_terms", []))
         self.assertFalse(diagnostics.get("unresolved_terms"))
 
+    def test_conversational_and_misspelled_analytical_words_are_not_unresolved(self):
+        query = "Hi which days had the heghest number of customers please?"
+        diagnostics = build_schema_resolution_diagnostics(
+            original_query=query,
+            corrected_query=query,
+            loaded_schema=_loaded_schema_fixture(),
+            validation_result=build_deterministic_schema_validation_result(
+                corrected_query=query,
+                loaded_schema=_loaded_schema_fixture(),
+            ),
+        )
+        self.assertNotIn("hi", diagnostics.get("unresolved_terms", []))
+        self.assertNotIn("heghest", diagnostics.get("unresolved_terms", []))
+        self.assertFalse(diagnostics.get("unresolved_terms"))
+
     def test_evolution_language_is_not_flagged_as_schema_error(self):
         query = "How does the relationship between customers and total sales change over time?"
         diagnostics = build_schema_resolution_diagnostics(
@@ -137,6 +152,93 @@ class PreprocessHighRecoveryTests(unittest.TestCase):
         )
         self.assertNotIn("together", diagnostics.get("unresolved_terms", []))
         self.assertFalse(diagnostics.get("unresolved_terms"))
+
+    def test_visualization_and_aggregation_intent_words_are_not_unresolved(self):
+        query = "Show the percentage share of total sales by month as line and bars"
+        diagnostics = build_schema_resolution_diagnostics(
+            original_query=query,
+            corrected_query=query,
+            loaded_schema=_loaded_schema_fixture(),
+            validation_result=build_deterministic_schema_validation_result(
+                corrected_query=query,
+                loaded_schema=_loaded_schema_fixture(),
+            ),
+        )
+        unresolved = diagnostics.get("unresolved_terms", [])
+        self.assertNotIn("percentage", unresolved)
+        self.assertNotIn("share", unresolved)
+        self.assertNotIn("line", unresolved)
+        self.assertNotIn("bars", unresolved)
+        self.assertFalse(unresolved)
+
+    def test_contribution_and_activity_words_are_not_unresolved(self):
+        query = "Show how customers and orders contribute to total activity per month"
+        diagnostics = build_schema_resolution_diagnostics(
+            original_query=query,
+            corrected_query=query,
+            loaded_schema=_loaded_schema_fixture(),
+            validation_result=build_deterministic_schema_validation_result(
+                corrected_query=query,
+                loaded_schema=_loaded_schema_fixture(),
+            ),
+        )
+        unresolved = diagnostics.get("unresolved_terms", [])
+        self.assertNotIn("contribute", unresolved)
+        self.assertNotIn("activity", unresolved)
+        self.assertFalse(unresolved)
+
+    def test_cumulative_and_noise_tokens_are_not_unresolved(self):
+        query = "ok Show cumulative total sales over time pp"
+        diagnostics = build_schema_resolution_diagnostics(
+            original_query=query,
+            corrected_query=query,
+            loaded_schema=_loaded_schema_fixture(),
+            validation_result=build_deterministic_schema_validation_result(
+                corrected_query=query,
+                loaded_schema=_loaded_schema_fixture(),
+            ),
+        )
+        unresolved = diagnostics.get("unresolved_terms", [])
+        self.assertNotIn("cumulative", unresolved)
+        self.assertNotIn("ok", unresolved)
+        self.assertNotIn("pp", unresolved)
+        self.assertFalse(unresolved)
+
+    def test_stacked_chart_word_is_not_unresolved(self):
+        query = "Show total_sales and orders per day as a stacked chart"
+        diagnostics = build_schema_resolution_diagnostics(
+            original_query=query,
+            corrected_query=query,
+            loaded_schema=_loaded_schema_fixture(),
+            validation_result=build_deterministic_schema_validation_result(
+                corrected_query=query,
+                loaded_schema=_loaded_schema_fixture(),
+            ),
+        )
+        unresolved = diagnostics.get("unresolved_terms", [])
+        self.assertNotIn("stacked", unresolved)
+        self.assertNotIn("chart", unresolved)
+        self.assertFalse(unresolved)
+
+    def test_month_and_action_words_are_not_unresolved(self):
+        query = "Visualize and calculate total_sales by month for January, February, and March 2023 and identify top days as a pie chart"
+        diagnostics = build_schema_resolution_diagnostics(
+            original_query=query,
+            corrected_query=query,
+            loaded_schema=_loaded_schema_fixture(),
+            validation_result=build_deterministic_schema_validation_result(
+                corrected_query=query,
+                loaded_schema=_loaded_schema_fixture(),
+            ),
+        )
+        unresolved = diagnostics.get("unresolved_terms", [])
+        self.assertNotIn("visualize", unresolved)
+        self.assertNotIn("calculate", unresolved)
+        self.assertNotIn("identify", unresolved)
+        self.assertNotIn("january", unresolved)
+        self.assertNotIn("february", unresolved)
+        self.assertNotIn("march", unresolved)
+        self.assertNotIn("pie", unresolved)
 
     @patch("preprocessing_high.preprocess_high_task.load_user_schema")
     @patch("preprocessing_high.preprocess_high_task.correct_query_terms")

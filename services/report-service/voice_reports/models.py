@@ -13,17 +13,25 @@ class VoiceReport(models.Model):
     
     CHART_CHOICES = [
         (ChartType.LINE, 'Line Chart'),
+        (ChartType.LINE_MULTI, 'Multi-Line Chart'),
         (ChartType.BAR, 'Bar Chart'),
+        (ChartType.BAR_GROUPED, 'Grouped Bar Chart'),
+        (ChartType.BAR_STACKED, 'Stacked Bar Chart'),
+        (ChartType.PIE, 'Pie Chart'),
+        (ChartType.AREA, 'Area Chart'),
+        (ChartType.MAP, 'Map'),
+        (ChartType.COMBO_LINE_BAR, 'Combo Line/Bar Chart'),
         (ChartType.CARD, 'Card'),
+        (ChartType.TABLE, 'Table'),
         (ChartType.SCATTER, 'Scatter Plot'),
         (ChartType.HISTOGRAM, 'Histogram'),
-        (ChartType.TABLE, 'Table'),
         # Legacy chart values kept for backward compatibility with old rows.
         ('kpi', 'Legacy KPI'),
         ('number', 'Legacy Number/KPI'),
         ('scalar', 'Legacy Scalar'),
         ('grouped_bar', 'Legacy Grouped Bar'),
-        ('pie', 'Legacy Pie'),
+        ('stacked_bar', 'Legacy Stacked Bar'),
+        ('combo', 'Legacy Combo'),
     ]
 
     STATUS_UPLOADED = 'uploaded'

@@ -35,7 +35,7 @@ ASC_RANK_KEYWORDS = (
 )
 
 AVG_KEYWORDS = ("average", "avg", "mean")
-COUNT_KEYWORDS = ("count", "how many", "number of")
+COUNT_KEYWORDS = ("count", "how many")
 SUM_KEYWORDS = ("sum", "total of", "in total", "overall total", "total")
 MAX_KEYWORDS = ("maximum", "max")
 MIN_KEYWORDS = ("minimum", "min")
@@ -59,17 +59,15 @@ BUSINESS_METRIC_HINT_TOKENS = (
     "amount",
 )
 ROW_COUNT_INTENT_PATTERNS = (
+    r"\brow count\b",
+    r"\bcount rows\b",
+    r"\bcount records\b",
+    r"\bcount of rows\b",
+    r"\bcount of records\b",
     r"\bnumber of rows\b",
     r"\bnumber of records\b",
-    r"\bcount of (?:rows|records|entries|transactions|days|weeks|items)\b",
-    r"\bcount (?:rows|records|entries|transactions|days|weeks|items)\b",
     r"\bhow many rows\b",
     r"\bhow many records\b",
-    r"\bhow many entries\b",
-    r"\bhow many transactions\b",
-    r"\bhow many days\b",
-    r"\bhow many weeks\b",
-    r"\bhow many items\b",
 )
 TIME_GRANULARITY_EXPRESSIONS = {
     "hour": "toStartOfHour({column})",
@@ -80,6 +78,20 @@ TIME_GRANULARITY_EXPRESSIONS = {
     "year": "toYear({column})",
 }
 TIME_GRANULARITY_TERMS = {"hour", "day", "week", "month", "quarter", "year"}
+GROUPING_WORDS = {
+    "day",
+    "days",
+    "week",
+    "weeks",
+    "month",
+    "months",
+    "year",
+    "years",
+    "region",
+    "regions",
+    "category",
+    "categories",
+}
 RELATIONSHIP_KEYWORDS = (
     "relationship",
     "correlation",
@@ -484,7 +496,7 @@ def normalize_analytical_intent(
     if time_granularity == "hour" and not _supports_hour_granularity(table_meta=table_meta, column_name=time_column):
         raise ValueError("Granularity not supported: hour-level data not available")
     if time_grouping_detected:
-        time_dimension_alias = "period"
+        time_dimension_alias = "date"
         time_dimension_expression = _time_dimension_expression(
             table_meta=table_meta,
             column_name=time_column,
@@ -506,10 +518,13 @@ def normalize_analytical_intent(
                 }
             )
 
+    question_rank_direction = _detect_rank_direction(question_lower)
     ranking = _infer_ranking(question_lower=question_lower, raw_intent=raw_intent)
     explicit_top_n_requested = bool(ranking.get("explicit_limit_requested"))
-    if (time_grouping_detected or relationship_requested) and not explicit_top_n_requested:
+    if (time_grouping_detected or relationship_requested) and not explicit_top_n_requested and not question_rank_direction:
         ranking["direction"] = None
+        ranking["limit"] = None
+        ranking["implied_limit"] = None
         ranking["source"] = "time_series_or_relationship_override"
     limit = ranking["limit"]
     ranking_requested = bool(ranking.get("direction")) or isinstance(limit, int)
@@ -572,10 +587,10 @@ def normalize_analytical_intent(
     elif limit and not order_by and metrics:
         primary_metric_alias = metrics[0]["alias"]
         order_by = [{"column": primary_metric_alias, "direction": "DESC"}]
-    if (time_grouping_detected or relationship_requested) and not explicit_top_n_requested:
+    if (time_grouping_detected or relationship_requested) and not explicit_top_n_requested and not ranking.get("direction"):
         limit = None
     if time_grouping_detected and not ranking["direction"]:
-        order_by = [{"column": time_dimension_alias or "period", "direction": "ASC"}]
+        order_by = [{"column": time_dimension_alias or "date", "direction": "ASC"}]
     if relationship_requested:
         order_by = []
 
@@ -596,11 +611,13 @@ def normalize_analytical_intent(
         distribution_requested=distribution_requested,
         time_grouping_detected=time_grouping_detected,
     )
-    if time_grouping_detected:
+    if time_grouping_detected and not ranking_requested:
         primary_intent = "time_series"
         if "time_grouping" not in operations:
             operations.append("time_grouping")
         operations = [op for op in operations if op != "ranking"]
+    elif ranking_requested:
+        primary_intent = "ranking"
     if relationship_requested and "comparison" not in operations:
         operations.append("comparison")
     ambiguities = _normalize_dimension_ambiguities(ambiguities)
@@ -612,6 +629,29 @@ def normalize_analytical_intent(
         aggregation_summary = "MIXED"
     else:
         aggregation_summary = None
+    metric_columns = [str(metric.get("column", "")).strip() for metric in metrics if isinstance(metric, dict) and str(metric.get("column", "")).strip() and str(metric.get("column", "")).strip() != "*"]
+    y_axis = [str(metric.get("alias") or metric.get("column") or "").strip() for metric in metrics if isinstance(metric, dict) and str(metric.get("alias") or metric.get("column") or "").strip()]
+    is_percentage = any(token in question_lower for token in ("share", "percentage", "percent", "contribution", "proportion", "part of total"))
+    is_distribution = distribution_requested or any(token in question_lower for token in ("distribution", "spread", "frequency", "histogram"))
+    geo_requested = any(token in question_lower for token in ("country", "city", "region", "state", "location", "latitude", "longitude", "lat", "lon"))
+    selected_chart_type = "table"
+    if time_grouping_detected and len(metric_columns) > 1:
+        selected_chart_type = "line_multi"
+    elif time_grouping_detected and metric_columns:
+        selected_chart_type = "line"
+    elif geo_requested and dimensions:
+        selected_chart_type = "map"
+    elif relationship_requested and len(metric_columns) >= 2 and not time_grouping_detected:
+        selected_chart_type = "scatter"
+    elif is_distribution:
+        selected_chart_type = "histogram"
+    elif is_percentage:
+        selected_chart_type = "pie"
+    elif dimensions and metric_columns:
+        selected_chart_type = "bar"
+    elif len(metric_columns) == 1 and not dimensions:
+        selected_chart_type = "card"
+    x_axis = (time_dimension_alias or "date") if time_grouping_detected else (dimensions[0] if dimensions else "")
 
     return {
         "intent_type": "analytical",
@@ -642,6 +682,18 @@ def normalize_analytical_intent(
         "row_count_requested": _is_explicit_row_count_request(question_lower),
         "analysis_mode": "relationship" if relationship_requested else "distribution" if distribution_requested else "",
         "reasoning_version": "semantic_ir_v1",
+        "selected_chart_type": selected_chart_type,
+        "chart_type": selected_chart_type,
+        "final_chart_type": selected_chart_type,
+        "explicit_chart_lock": False,
+        "x_axis": x_axis,
+        "y_axis": y_axis,
+        "is_time_series": bool(time_grouping_detected),
+        "is_percentage": bool(is_percentage),
+        "is_distribution": bool(is_distribution),
+        "metric_type": "percentage" if is_percentage else "absolute",
+        "chart_reason": "deterministic chart selection from normalized analytical intent",
+        "chart_reason_code": "deterministic_chart_selection",
     }
 
 
@@ -660,12 +712,12 @@ def _infer_time_granularity(question_lower: str) -> str:
     if not normalized:
         return ""
     explicit_patterns = (
-        (r"\b(?:per|by|for each|in each|grouped by)\s+hour\b", "hour"),
-        (r"\b(?:per|by|for each|in each|grouped by)\s+day\b", "day"),
-        (r"\b(?:per|by|for each|in each|grouped by)\s+week\b", "week"),
-        (r"\b(?:per|by|for each|in each|grouped by)\s+month\b", "month"),
-        (r"\b(?:per|by|for each|in each|grouped by)\s+quarter\b", "quarter"),
-        (r"\b(?:per|by|for each|in each|grouped by)\s+year\b", "year"),
+        (r"\b(?:per|by|across|for each|in each|grouped by)\s+hours?\b", "hour"),
+        (r"\b(?:per|by|across|for each|in each|grouped by)\s+days?\b", "day"),
+        (r"\b(?:per|by|across|for each|in each|grouped by)\s+weeks?\b", "week"),
+        (r"\b(?:per|by|across|for each|in each|grouped by)\s+months?\b", "month"),
+        (r"\b(?:per|by|across|for each|in each|grouped by)\s+quarters?\b", "quarter"),
+        (r"\b(?:per|by|across|for each|in each|grouped by)\s+years?\b", "year"),
     )
     for pattern, granularity in explicit_patterns:
         if re.search(pattern, normalized):
@@ -676,13 +728,13 @@ def _infer_time_granularity(question_lower: str) -> str:
 
     # Soft inference when time concepts are present without explicit "per".
     soft_patterns = (
-        (r"\bhourly\b|\bhour\b", "hour"),
-        (r"\bdaily\b|\bday\b", "day"),
+        (r"\bhourly\b|\bhours?\b", "hour"),
+        (r"\bdaily\b|\bdays?\b", "day"),
         (r"\bdate\b|\btime\b", "day"),
-        (r"\bweekly\b|\bweek\b", "week"),
-        (r"\bmonthly\b|\bmonth\b", "month"),
-        (r"\bquarterly\b|\bquarter\b", "quarter"),
-        (r"\byearly\b|\byear\b|\bannual\b|\bannually\b", "year"),
+        (r"\bweekly\b|\bweeks?\b", "week"),
+        (r"\bmonthly\b|\bmonths?\b", "month"),
+        (r"\bquarterly\b|\bquarters?\b", "quarter"),
+        (r"\byearly\b|\byears?\b|\bannual\b|\bannually\b", "year"),
     )
     for pattern, granularity in soft_patterns:
         if re.search(pattern, normalized):
@@ -731,20 +783,32 @@ def _time_dimension_expression(*, table_meta: dict[str, Any], column_name: str, 
     column_meta = table_meta.get("column_map", {}).get(column_name, {})
     column_type = str(column_meta.get("type", "")).strip().lower()
     normalized_column = column_name
-    already_to_date = normalized_column.lower().startswith("todate(")
-    if (
+    string_like_type = (
         "string" in column_type
         or "fixedstring" in column_type
         or "varchar" in column_type
         or "char" in column_type
-    ):
-        normalized_column = f"toDate({column_name})" if not already_to_date else normalized_column
+    )
+    if string_like_type:
+        parsed_expr = _string_time_parse_expr(column_name)
+        if granularity == "day":
+            return f"toDate({parsed_expr})"
+        normalized_column = parsed_expr
     if granularity == "hour":
-        if "string" in column_type or "fixedstring" in column_type or "varchar" in column_type or "char" in column_type:
-            normalized_column = f"toDateTime({column_name})"
+        if string_like_type:
+            normalized_column = _string_time_parse_expr(column_name)
         elif "date" in column_type and "datetime" not in column_type and "timestamp" not in column_type:
             normalized_column = f"toDateTime({column_name})"
     return template.format(column=normalized_column)
+
+
+def _string_time_parse_expr(column_name: str) -> str:
+    return (
+        f"coalesce("
+        f"parseDateTimeBestEffortUSOrNull({column_name}), "
+        f"parseDateTimeBestEffortOrNull({column_name})"
+        f")"
+    )
 
 
 def _source_grain_matches_requested(
@@ -1049,8 +1113,8 @@ def _expand_tokens(tokens: set[str]) -> set[str]:
 
 
 def _detect_rank_direction(question_lower: str) -> str | None:
-    has_desc = any(keyword in question_lower for keyword in DESC_RANK_KEYWORDS)
-    has_asc = any(keyword in question_lower for keyword in ASC_RANK_KEYWORDS)
+    has_desc = any(re.search(rf"\b{re.escape(keyword)}\b", question_lower) for keyword in DESC_RANK_KEYWORDS)
+    has_asc = any(re.search(rf"\b{re.escape(keyword)}\b", question_lower) for keyword in ASC_RANK_KEYWORDS)
     if has_desc and has_asc:
         # In mixed phrasing (e.g. "top ... worst"), explicit low-end terms should win.
         return "ASC"
@@ -1062,15 +1126,12 @@ def _detect_rank_direction(question_lower: str) -> str | None:
 
 
 def _extract_limit(question_lower: str, raw_intent: dict[str, Any]) -> tuple[int | None, bool]:
-    raw_limit = raw_intent.get("limit")
-    if isinstance(raw_limit, int) and raw_limit > 0:
-        return raw_limit, True
-
     patterns = (
         r"\btop\s+(\d+)\b",
         r"\bbottom\s+(\d+)\b",
         r"\bfirst\s+(\d+)\b",
         r"\blast\s+(\d+)\b",
+        r"\blimit(?:ed)?\s+(?:to\s+)?(\d+)\b",
         r"\b(\d+)\s+\w+\s+with\s+(?:the\s+)?(?:highest|lowest|largest|smallest|best|worst)\b",
     )
     for pattern in patterns:
@@ -1079,6 +1140,10 @@ def _extract_limit(question_lower: str, raw_intent: dict[str, Any]) -> tuple[int
             value = int(match.group(1))
             if value > 0:
                 return value, True
+
+    raw_limit = raw_intent.get("limit")
+    if isinstance(raw_limit, int) and raw_limit > 0:
+        return raw_limit, False
     return None, False
 
 
@@ -1361,6 +1426,10 @@ def _infer_metrics(
             metric_candidates.append((resolved, None))
             seen_columns.add(resolved)
 
+    raw_metric_candidates = _iter_raw_metric_candidates(raw_intent)
+    has_grouping_words = any(re.search(rf"\b{re.escape(word)}\b", question_lower) for word in GROUPING_WORDS)
+    ranking_requested = bool(ranking.get("direction")) or isinstance(ranking.get("limit"), int)
+
     if explicit_agg == "COUNT" and not metric_candidates:
         entity_match = re.search(r"\bhow many\s+([a-z_][a-z0-9_ ]*)\b", question_lower)
         if entity_match:
@@ -1368,7 +1437,7 @@ def _infer_metrics(
             metric_column = _resolve_column_name(entity, all_columns)
             if metric_column:
                 metric_candidates.append((metric_column, None))
-        if not metric_candidates:
+        if not metric_candidates and row_count_request:
             metric_candidates.append(("*", "COUNT"))
 
     if not metric_candidates:
@@ -1386,7 +1455,13 @@ def _infer_metrics(
             if not metric_candidates:
                 metric_candidates.append((scored[0], None))
         else:
-            if not metric_candidates:
+            if (
+                not metric_candidates
+                and row_count_request
+                and not ranking_requested
+                and not has_grouping_words
+                and not raw_metric_candidates
+            ):
                 metric_candidates.append(("*", "COUNT"))
 
     metrics: list[dict[str, Any]] = []
@@ -1877,6 +1952,8 @@ def _derive_operations(
         operations.append("filtering")
     if ranking_requested:
         operations.append("ranking")
+    if order_by:
+        operations.append("sorting")
     if limit:
         operations.append("limiting")
     if dimensions and len(metrics) > 1:

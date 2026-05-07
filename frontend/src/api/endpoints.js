@@ -102,9 +102,6 @@ export const databaseAPI = {
     formData.append('file', file)
     
     return apiClient.post('/database/upload/', formData, {
-      headers: {
-        'Content-Type': 'multipart/form-data',
-      },
       onUploadProgress,
     })
   },
@@ -133,9 +130,6 @@ export const voiceReportsAPI = {
     formData.append('audio', audioFile)
     
     return apiClient.post('/voice-reports/upload/', formData, {
-      headers: {
-        'Content-Type': 'multipart/form-data',
-      },
       onUploadProgress,
     })
   },
@@ -170,6 +164,9 @@ export const voiceReportsAPI = {
 
   // Dashboard aggregate counters
   getDashboardStats: () => apiClient.get('/voice-reports/dashboard/stats/'),
+
+  // Poll job status (async pipeline)
+  getJobStatus: (jobId) => apiClient.get(`/voice-reports/jobs/${jobId}/status/`),
 }
 
 // ============================================================================

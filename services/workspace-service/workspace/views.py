@@ -21,6 +21,73 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+class WorkspaceDetailByIdView(APIView):
+    """
+    Service-to-service and API lookup: GET /workspace/<id>/
+
+    Returns workspace metadata including ``manager_id`` (workspace owner user id)
+    for downstream BI services (voice-service) that resolve dataset binding context.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, workspace_id):
+        user = request.user
+
+        if not user.is_verified:
+            return Response(
+                {
+                    "success": False,
+                    "message": "Please verify your email before accessing workspace features.",
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        try:
+            workspace = Workspace.objects.select_related("owner").get(id=workspace_id)
+        except Workspace.DoesNotExist:
+            return Response(
+                {"success": False, "message": "Workspace not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if user.role == "manager" and workspace.owner_id == user.id:
+            allowed = True
+        elif WorkspaceMember.objects.filter(
+            workspace=workspace,
+            user=user,
+            status="active",
+        ).exists():
+            allowed = True
+        elif workspace.owner_id == user.id:
+            allowed = True
+        else:
+            allowed = False
+
+        if not allowed:
+            return Response(
+                {"success": False, "message": "You do not have access to this workspace."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        workspace_serializer = WorkspaceSerializer(workspace)
+        owner = workspace.owner
+        return Response(
+            {
+                "success": True,
+                "id": workspace.id,
+                "manager_id": workspace.owner_id,
+                "workspace": workspace_serializer.data,
+                "owner": {
+                    "id": owner.id,
+                    "name": owner.name,
+                    "email": owner.email,
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
 class WorkspaceUpdateView(APIView):
     """
     API endpoint for updating workspace information.

@@ -5,10 +5,12 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
+COPY services/report-service/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --default-timeout=600 --retries 25 --progress-bar off --upgrade pip "setuptools<81" wheel && pip install --no-cache-dir --default-timeout=600 --retries 25 --progress-bar off -r /app/requirements.txt
 
-COPY . /app
+COPY services/report-service /app
+COPY shared /app/shared
+COPY bi_platform_shared /app/bi_platform_shared
 
 EXPOSE 8003
 

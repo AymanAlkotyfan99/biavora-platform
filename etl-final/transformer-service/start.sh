@@ -14,23 +14,18 @@ import time
 sys.path.insert(0, '/app/transformer-service/transformer')
 sys.path.insert(0, '/app')
 
-max_retries = 10
-retry_count = 0
+attempt = 1
 
-while retry_count < max_retries:
+while True:
     try:
-        print(f'[TRANSFORMER] Attempting to start listener (attempt {retry_count + 1}/{max_retries})...')
+        print(f'[TRANSFORMER] Starting listener (attempt {attempt})...')
         from engine.kafka_listener import start_listener
         start_listener()
-        break
+        print('[TRANSFORMER] Listener stopped unexpectedly. Restarting in 10 seconds...')
     except Exception as e:
         print(f'[TRANSFORMER ERROR] Failed to connect: {e}')
-        retry_count += 1
-        if retry_count < max_retries:
-            print(f'[TRANSFORMER] Retrying in 10 seconds...')
-            time.sleep(10)
-        else:
-            print(f'[TRANSFORMER] Max retries reached. Exiting.')
-            sys.exit(1)
+    attempt += 1
+    print('[TRANSFORMER] Retrying in 10 seconds...')
+    time.sleep(10)
 "
 

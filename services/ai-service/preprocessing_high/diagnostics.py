@@ -32,6 +32,34 @@ _TIME_TERMS = {
     "quarterly",
     "yearly",
     "hourly",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+    "jan",
+    "feb",
+    "mar",
+    "apr",
+    "jun",
+    "jul",
+    "aug",
+    "sep",
+    "sept",
+    "oct",
+    "nov",
+    "dec",
+    "q1",
+    "q2",
+    "q3",
+    "q4",
 }
 
 _STOP_WORDS = {
@@ -146,6 +174,15 @@ _STOP_WORDS = {
     "alongside",
     "simultaneously",
     "concurrently",
+    "visualize",
+    "plot",
+    "identify",
+    "calculate",
+    "compute",
+    "find",
+    "pie",
+    "donut",
+    "doughnut",
 }
 
 _TYPO_SCORE_THRESHOLD = 0.82
@@ -209,7 +246,66 @@ _ANALYTICAL_LANGUAGE_TERMS = {
     "variation",
     "value",
     "values",
+    "activity",
+    "contribution",
+    "contribute",
+    "contributes",
+    "contributing",
+    "share",
+    "shares",
+    "percentage",
+    "percent",
+    "ratio",
+    "cumulative",
+    "accumulated",
+    "running",
+    "line",
+    "lines",
+    "bar",
+    "bars",
+    "chart",
+    "charts",
+    "plot",
+    "plots",
+    "stack",
+    "stacked",
+    "combo",
+    "mixed",
+    "visualize",
+    "visualized",
+    "visualization",
+    "identify",
+    "identified",
+    "calculate",
+    "calculated",
+    "calculating",
+    "compute",
+    "computed",
+    "computing",
+    "pie",
+    "donut",
+    "doughnut",
 }
+
+_CONVERSATIONAL_TERMS = {
+    "hi",
+    "hello",
+    "hey",
+    "ok",
+    "okay",
+    "thanks",
+    "thank",
+    "please",
+}
+
+_NON_SCHEMA_LANGUAGE_TERMS = (
+    _STOP_WORDS
+    | _ANALYTICAL_LANGUAGE_TERMS
+    | _TIME_TERMS
+    | _CONVERSATIONAL_TERMS
+)
+
+_NON_SCHEMA_LANGUAGE_TYPO_THRESHOLD = 0.82
 
 
 def _supported_temporal_phrase_terms(query_text: str) -> set[str]:
@@ -226,6 +322,40 @@ def _is_analytical_language_term(term: str) -> bool:
     if not normalized:
         return False
     return normalized in _ANALYTICAL_LANGUAGE_TERMS
+
+
+def _is_non_schema_language_term(term: str) -> bool:
+    normalized = _normalize_phrase(term)
+    if not normalized:
+        return False
+    if normalized in _NON_SCHEMA_LANGUAGE_TERMS:
+        return True
+    if len(normalized) <= 2:
+        return False
+
+    # Treat typo-like variants of control/analytical language as non-schema
+    # so they do not become false unresolved schema terms.
+    candidates = get_close_matches(
+        normalized,
+        list(_NON_SCHEMA_LANGUAGE_TERMS),
+        n=1,
+        cutoff=_NON_SCHEMA_LANGUAGE_TYPO_THRESHOLD,
+    )
+    return bool(candidates)
+
+
+def _is_non_schema_noise_term(term: str) -> bool:
+    normalized = _normalize_phrase(term)
+    if not normalized:
+        return False
+    if len(normalized) <= 2 and normalized not in {"id", "ds"}:
+        # Ignore short conversational/garbage tokens (e.g., "pp", "ok")
+        # unless they are common schema identifiers.
+        return True
+    # Ignore tokens made of a single repeated character sequence.
+    if len(normalized) >= 2 and len(set(normalized)) == 1:
+        return True
+    return False
 
 
 def _safe_singular_forms(value: str) -> list[str]:
@@ -742,13 +872,24 @@ def build_schema_resolution_diagnostics(
             matched_columns.append(candidate_column)
             continue
 
-        if _is_analytical_language_term(term):
+        if _is_non_schema_language_term(term) or _is_analytical_language_term(term):
             term_resolutions.append(
                 {
                     "term": term,
                     "resolution_status": "analytical_language",
                     "matched_column": "",
                     "reason": "Generic analytical wording; not treated as a schema reference.",
+                }
+            )
+            continue
+
+        if _is_non_schema_noise_term(term):
+            term_resolutions.append(
+                {
+                    "term": term,
+                    "resolution_status": "analytical_language",
+                    "matched_column": "",
+                    "reason": "Non-schema conversational/noise token ignored.",
                 }
             )
             continue

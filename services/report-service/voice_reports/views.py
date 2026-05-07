@@ -1,1631 +1,223 @@
-﻿"""
-Voice Reports Views
+"""
+Voice Reports Views (read-only).
 
-API endpoints for voice-driven BI system.
-Orchestrates Small Whisper, ClickHouse, and Metabase.
+Per CRIT-01 of the BACKEND_FULL_AUDIT_AND_FIX_ROADMAP, report-service no
+longer owns any orchestration. Voice ingestion, SQL generation, query
+execution, and chart rendering are exclusively handled by:
+
+    voice-service   -> orchestration of the agent pipeline
+    ai-service      -> LLM stages (transcription, intent, SQL, chart contract)
+    query-service   -> ClickHouse execution + SQLGuard
+    visualization-service -> Metabase question/dashboard rendering
+
+This module exposes ONLY read-only endpoints that fetch persisted reports
+from the report-service database. They never trigger pipeline execution.
 """
 
+from __future__ import annotations
 
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.parsers import MultiPartParser, FormParser
-from rest_framework import status
-from django.shortcuts import get_object_or_404
-from django.http import Http404
+import logging
+
 from django.db.models import Sum
 from django.db.models.functions import Coalesce
-import logging
-import os
-import requests
+from django.http import Http404
+from django.shortcuts import get_object_or_404
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
 
-from .models import VoiceReport, SQLEditHistory
-from .constants import ChartType, normalize_chart_type, to_metabase_display
-from .services import (
-    get_small_whisper_client,
-    get_clickhouse_executor,
-    SQLGuard,
-    get_metabase_service
-)
-from .services.clickhouse_executor import sanitize_query_results
-from .services.ai_trace_service import build_ai_trace_payload
-from .utils import infer_chart_type, profile_result_shape
-from users.permissions import IsManager, IsAnalyst, IsExecutive
+from .models import VoiceReport
 
 logger = logging.getLogger(__name__)
-LOW_CHANGE_TYPES = {"removed_noise", "normalized", "reduced_repetition", "removed_filler_words", "removed_noise_tags", "removed_noise_tokens", "normalized_repeated_characters", "normalized_punctuation", "normalized_whitespace", "removed_control_chars", "removed_malformed_symbols", "normalized_control_chars"}
-HIGH_ADJUSTMENT_TYPES = {"derived_field", "mapped_column"}
 
 
-def build_report_ai_trace(report, *, embed_url: str = "") -> dict:
-    return build_ai_trace_payload(
-        report_id=report.id,
-        transcription=report.transcription,
-        preprocessing_low=report.preprocessing_low,
-        preprocessing_high=report.preprocessing_high,
-        intent_json=report.intent_json,
-        pipeline_trace=report.pipeline_trace,
-        generated_sql=report.generated_sql,
-        reviewed_sql=report.final_sql,
-        query_result=report.query_result,
-        execution_time_ms=report.execution_time_ms,
-        row_count=report.row_count,
-        chart_type=report.chart_type,
-        metabase_question_id=report.metabase_question_id,
-        metabase_dashboard_id=report.metabase_dashboard_id,
-        embed_url=embed_url,
-        chart_config=report.chart_config,
-        error_message=report.error_message,
-    )
+def _get_user_workspace(user):
+    """Return the workspace this user is bound to (read-only side of the model)."""
+
+    role = str(getattr(user, "role", "") or "").lower()
+    if role == "manager":
+        return user.owned_workspaces.first()
+    membership = user.workspace_memberships.filter(status="active").first()
+    return membership.workspace if membership else None
 
 
-def normalize_chart_payload(chart_payload):
-    """
-    Normalize chart payloads coming from external components (e.g., Small Whisper).
-    """
-    if not isinstance(chart_payload, dict):
-        return chart_payload
-    raw_type = (
-        chart_payload.get("selected_chart_type")
-        or chart_payload.get("chart_type")
-        or chart_payload.get("type")
-    )
-    normalized_type = normalize_chart_type(raw_type, default="")
-    normalized_payload = dict(chart_payload)
-    if not normalized_type:
-        return normalized_payload
-    if raw_type and raw_type != normalized_type:
-        logger.info(
-            "Chart type mapping applied: source=%s mapped=%s",
-            raw_type,
-            normalized_type,
-        )
-    normalized_payload["selected_chart_type"] = normalized_type
-    normalized_payload["chart_type"] = normalized_type
-    normalized_payload["type"] = normalized_type
-    return normalized_payload
-
-
-def get_user_workspace(user):
-    """
-    Get the user's workspace based on their role.
-    
-    - Manager: Returns their owned workspace
-    - Analyst/Executive: Returns workspace they're a member of
-    """
-    if user.role == 'manager':
-        # Manager owns workspace
-        workspace = user.owned_workspaces.first()
-        return workspace
-    else:
-        # Analyst or Executive is a member
-        membership = user.workspace_memberships.filter(status='active').first()
-        if membership:
-            return membership.workspace
-        return None
-
-
-def get_report_embed_url(report, metabase_service=None):
-    """
-    Generate a fresh Metabase question embed URL for every response.
-    """
-    if not report.metabase_question_id:
-        return ""
-
-    metabase = metabase_service or get_metabase_service()
-    embed_url = metabase.get_question_embed_url(report.metabase_question_id)
-    if embed_url:
-        return embed_url
-
-    logger.warning(
-        "Failed to generate dynamic embed URL for report=%s question=%s error=%s",
-        report.id,
-        report.metabase_question_id,
-        metabase.last_error
-    )
-    return ""
-
-
-def build_default_preprocessing_low(original_text: str = "") -> dict:
-    normalized_text = str(original_text or "")
+def _serialize_report_summary(report: VoiceReport) -> dict:
     return {
-        "original_text": normalized_text,
-        "cleaned_text": normalized_text,
-        "changes": [],
+        "id": report.id,
+        "transcription": report.transcription,
+        "status": report.status,
+        "created_at": report.created_at,
+        "created_by": getattr(report.created_by, "email", None),
+        "chart_type": report.chart_type,
+        "row_count": report.row_count,
+        "execution_time_ms": report.execution_time_ms,
+        "sql": report.final_sql,
+        "embed_url": report.embed_url if hasattr(report, "embed_url") else "",
+        "metabase_question_id": report.metabase_question_id,
+        "metabase_dashboard_id": report.metabase_dashboard_id,
     }
 
 
-def build_default_preprocessing_high(corrected_query: str = "") -> dict:
-    return {
-        "corrected_query": str(corrected_query or ""),
-        "term_corrections": [],
-        "user_friendly_messages": [],
-        "schema_used": {"tables": [], "columns": []},
-        "schema_adjustments": [],
-        "unresolved_terms": [],
-        "unsupported_terms": [],
-        "term_resolutions": [],
-        "schema_validation_status": "unknown",
-        "candidate_columns": {},
-        "candidate_tables": [],
-        "selected_table": "",
-        "selected_columns": [],
-    }
-
-
-def build_default_pipeline_trace() -> dict:
-    return {
-        "request_metadata": {},
-        "overall_status": {"status": "unknown"},
-        "root_cause": {
-            "root_cause_category": "unknown",
-            "root_cause_detail": "",
-            "analyst_recommended_fix": "",
-        },
-    }
-
-
-def normalize_pipeline_trace(payload) -> dict:
-    fallback = build_default_pipeline_trace()
-    if not isinstance(payload, dict):
-        return fallback
-    normalized = dict(payload)
-    normalized.setdefault("request_metadata", {})
-    normalized.setdefault("overall_status", {"status": "unknown"})
-    normalized.setdefault(
-        "root_cause",
+def _serialize_report_detail(report: VoiceReport) -> dict:
+    payload = _serialize_report_summary(report)
+    payload.update(
         {
-            "root_cause_category": "unknown",
-            "root_cause_detail": "",
-            "analyst_recommended_fix": "",
-        },
-    )
-    return normalized
-
-
-def extract_pipeline_contract(pipeline_trace, *, confidence=None, confidence_breakdown=None, degraded=None) -> dict:
-    trace = pipeline_trace if isinstance(pipeline_trace, dict) else {}
-    overall = trace.get("overall_status", {}) if isinstance(trace.get("overall_status"), dict) else {}
-    status_value = str(overall.get("status") or trace.get("status") or "").strip().lower()
-    breakdown = confidence_breakdown or overall.get("confidence_breakdown") or trace.get("confidence_breakdown")
-    score = confidence
-    if score is None:
-        score = overall.get("confidence", trace.get("confidence"))
-    try:
-        score = None if score is None else max(0.0, min(1.0, float(score)))
-    except (TypeError, ValueError):
-        score = None
-    derived_degraded = degraded
-    if derived_degraded is None:
-        derived_degraded = status_value == "degraded" or any(
-            isinstance(stage, dict)
-            and (
-                str(stage.get("status", "")).strip().lower() == "degraded"
-                or bool(stage.get("degraded"))
-            )
-            for stage in trace.values()
-        )
-    return {
-        "status": status_value or "unknown",
-        "degraded": bool(derived_degraded),
-        "confidence": score,
-        "confidence_breakdown": breakdown if isinstance(breakdown, dict) else None,
-    }
-
-
-def extract_report_contract(report) -> dict:
-    chart_config = report.chart_config if isinstance(report.chart_config, dict) else {}
-    stored = chart_config.get("ai_contract", {}) if isinstance(chart_config.get("ai_contract"), dict) else {}
-    trace_contract = extract_pipeline_contract(report.pipeline_trace)
-    return {
-        **trace_contract,
-        **{key: value for key, value in stored.items() if value is not None},
-    }
-
-
-def _flatten_schema_columns(columns_payload) -> list[str]:
-    flattened: list[str] = []
-    if isinstance(columns_payload, dict):
-        for table_name, columns in columns_payload.items():
-            normalized_table = str(table_name or "").strip()
-            if not isinstance(columns, list):
-                continue
-            for column in columns:
-                if isinstance(column, dict):
-                    column_name = str(column.get("name", "")).strip()
-                else:
-                    column_name = str(column or "").strip()
-                if not column_name:
-                    continue
-                if normalized_table:
-                    flattened.append(f"{normalized_table}.{column_name}")
-                else:
-                    flattened.append(column_name)
-        return flattened
-    if isinstance(columns_payload, list):
-        return [str(column) for column in columns_payload if str(column or "").strip()]
-    return flattened
-
-
-def _dedupe_non_empty(values) -> list[str]:
-    deduped: list[str] = []
-    seen: set[str] = set()
-    if not isinstance(values, list):
-        return deduped
-    for value in values:
-        normalized = str(value or "").strip()
-        if not normalized:
-            continue
-        signature = normalized.lower()
-        if signature in seen:
-            continue
-        seen.add(signature)
-        deduped.append(normalized)
-    return deduped
-
-
-def _extract_term_corrections_from_mappings(mappings) -> list[dict]:
-    corrections: list[dict] = []
-    if not isinstance(mappings, list):
-        return corrections
-    for mapping in mappings:
-        if not isinstance(mapping, dict):
-            continue
-        status = str(mapping.get("status", "")).strip().lower()
-        if status not in {"mapped", "derivable"}:
-            continue
-        requested = str(mapping.get("requested", "")).strip()
-        matched_column = str(mapping.get("matched_column", "")).strip()
-        matched_table = str(mapping.get("matched_table", "")).strip()
-        if not requested or not matched_column:
-            continue
-        corrections.append(
-            {
-                "original": requested,
-                "corrected": matched_column,
-                "matched_column": f"{matched_table}.{matched_column}" if matched_table else matched_column,
-            }
-        )
-    return corrections
-
-
-def _extract_schema_adjustments_from_mappings(mappings) -> list[dict]:
-    adjustments: list[dict] = []
-    if not isinstance(mappings, list):
-        return adjustments
-    for mapping in mappings:
-        if not isinstance(mapping, dict):
-            continue
-        status = str(mapping.get("status", "")).strip().lower()
-        requested = str(mapping.get("requested", "")).strip()
-        matched_column = str(mapping.get("matched_column", "")).strip()
-        matched_table = str(mapping.get("matched_table", "")).strip()
-        if status == "mapped" and requested and matched_column:
-            fully_qualified = f"{matched_table}.{matched_column}" if matched_table else matched_column
-            adjustments.append(
-                {
-                    "type": "mapped_column",
-                    "description": f"Mapped '{requested}' to '{fully_qualified}'.",
-                }
-            )
-        elif status == "derivable" and requested and matched_column:
-            fully_qualified = f"{matched_table}.{matched_column}" if matched_table else matched_column
-            adjustments.append(
-                {
-                    "type": "derived_field",
-                    "description": f"Derived '{requested}' from '{fully_qualified}'.",
-                }
-            )
-    return adjustments
-
-
-def _extract_schema_usage_from_mappings(mappings) -> tuple[list[str], list[str]]:
-    tables: list[str] = []
-    columns: list[str] = []
-    if not isinstance(mappings, list):
-        return tables, columns
-    for mapping in mappings:
-        if not isinstance(mapping, dict):
-            continue
-        status = str(mapping.get("status", "")).strip().lower()
-        if status not in {"exact", "mapped", "derivable"}:
-            continue
-        matched_table = str(mapping.get("matched_table", "")).strip()
-        matched_column = str(mapping.get("matched_column", "")).strip()
-        if matched_table:
-            tables.append(matched_table)
-        if matched_column:
-            columns.append(f"{matched_table}.{matched_column}" if matched_table else matched_column)
-    return _dedupe_non_empty(tables), _dedupe_non_empty(columns)
-
-
-def normalize_preprocessing_low(payload, fallback_text: str = "") -> dict:
-    fallback = build_default_preprocessing_low(fallback_text)
-    if not isinstance(payload, dict):
-        return fallback
-
-    original_text = str(payload.get("original_text") or fallback_text or "").strip()
-    cleaned_text = str(payload.get("cleaned_text") or original_text).strip()
-    raw_changes = payload.get("changes", [])
-    if not isinstance(raw_changes, list):
-        raw_changes = []
-    if not raw_changes:
-        raw_changes = payload.get("detected_changes", [])
-    normalized_changes = []
-    if isinstance(raw_changes, list):
-        for change in raw_changes:
-            if not isinstance(change, dict):
-                continue
-            change_type = str(change.get("type", "normalized")).strip().lower()
-            if change_type not in LOW_CHANGE_TYPES:
-                change_type = "normalized"
-            normalized_changes.append(
-                {
-                    "type": change_type,
-                    "before": str(change.get("before", "")).strip(),
-                    "after": str(change.get("after", "")).strip(),
-                }
-            )
-
-    return {
-        "original_text": original_text,
-        "cleaned_text": cleaned_text,
-        "changes": normalized_changes,
-    }
-
-
-def normalize_preprocessing_high(payload, fallback_query: str = "") -> dict:
-    fallback = build_default_preprocessing_high(fallback_query)
-    if not isinstance(payload, dict):
-        return fallback
-
-    corrected_query = str(
-        payload.get("corrected_query")
-        or payload.get("final_query")
-        or fallback_query
-        or ""
-    ).strip()
-    selected_table = str(payload.get("selected_table", "")).strip()
-    selected_columns = _dedupe_non_empty(
-        payload.get("selected_columns", []) if isinstance(payload.get("selected_columns"), list) else []
-    )
-    mappings = payload.get("mappings", []) if isinstance(payload.get("mappings"), list) else []
-
-    term_corrections = []
-    raw_corrections = payload.get("term_corrections", [])
-    if isinstance(raw_corrections, list):
-        for correction in raw_corrections:
-            if not isinstance(correction, dict):
-                continue
-            original_value = (
-                correction.get("original")
-                or correction.get("from")
-                or correction.get("source")
-                or ""
-            )
-            corrected_value = (
-                correction.get("corrected")
-                or correction.get("to")
-                or correction.get("target")
-                or ""
-            )
-            term_corrections.append(
-                {
-                    "original": str(original_value).strip(),
-                    "corrected": str(corrected_value).strip(),
-                    "matched_column": str(
-                        correction.get("matched_column", "") or correction.get("matched", "")
-                    ).strip(),
-                    "from": str(original_value).strip(),
-                    "to": str(corrected_value).strip(),
-                    "type": str(correction.get("type", "")).strip(),
-                    "message": str(correction.get("message", "")).strip(),
-                }
-            )
-    if not term_corrections and mappings:
-        term_corrections = _extract_term_corrections_from_mappings(mappings)
-
-    raw_schema_used = payload.get("schema_used", {})
-    tables = []
-    columns = []
-    if isinstance(raw_schema_used, dict):
-        raw_tables = raw_schema_used.get("tables", [])
-        if isinstance(raw_tables, list):
-            tables = _dedupe_non_empty(raw_tables)
-        columns = _flatten_schema_columns(raw_schema_used.get("columns", []))
-
-    schema_adjustments = []
-    raw_adjustments = payload.get("schema_adjustments", [])
-    if isinstance(raw_adjustments, list):
-        for adjustment in raw_adjustments:
-            if not isinstance(adjustment, dict):
-                continue
-            adjustment_type = str(adjustment.get("type", "mapped_column")).strip().lower()
-            if adjustment_type not in HIGH_ADJUSTMENT_TYPES:
-                adjustment_type = "mapped_column"
-            schema_adjustments.append(
-                {
-                    "type": adjustment_type,
-                    "description": str(adjustment.get("description", "")).strip(),
-                }
-            )
-    if not schema_adjustments and mappings:
-        schema_adjustments = _extract_schema_adjustments_from_mappings(mappings)
-
-    if not tables and selected_table:
-        tables = [selected_table]
-    if not columns and selected_columns:
-        columns = [
-            f"{selected_table}.{column}" if selected_table else column
-            for column in selected_columns
-        ]
-
-    if not tables or not columns:
-        mapping_tables, mapping_columns = _extract_schema_usage_from_mappings(mappings)
-        if not tables and mapping_tables:
-            tables = mapping_tables
-        if not columns and mapping_columns:
-            columns = mapping_columns
-
-    tables = _dedupe_non_empty(tables)
-    columns = _dedupe_non_empty(columns)
-    if not selected_table and len(tables) == 1:
-        selected_table = tables[0]
-    if not selected_columns and columns:
-        selected_columns = [
-            column.split(".", 1)[1]
-            if selected_table and column.lower().startswith(f"{selected_table.lower()}.")
-            else column.split(".")[-1]
-            for column in columns
-        ]
-        selected_columns = _dedupe_non_empty(selected_columns)
-
-    return {
-        "corrected_query": corrected_query,
-        "term_corrections": term_corrections,
-        "user_friendly_messages": [
-            str(message).strip()
-            for message in payload.get("user_friendly_messages", [])
-            if str(message).strip()
-        ]
-        if isinstance(payload.get("user_friendly_messages"), list)
-        else [],
-        "schema_used": {
-            "tables": tables,
-            "columns": columns,
-        },
-        "schema_adjustments": schema_adjustments,
-        "unresolved_terms": [
-            str(term).strip()
-            for term in payload.get("unresolved_terms", [])
-            if str(term).strip()
-        ]
-        if isinstance(payload.get("unresolved_terms"), list)
-        else [],
-        "unsupported_terms": [
-            str(term).strip()
-            for term in payload.get("unsupported_terms", [])
-            if str(term).strip()
-        ]
-        if isinstance(payload.get("unsupported_terms"), list)
-        else [],
-        "term_resolutions": payload.get("term_resolutions", [])
-        if isinstance(payload.get("term_resolutions"), list)
-        else [],
-        "schema_validation_status": str(payload.get("schema_validation_status", "unknown")),
-        "candidate_columns": payload.get("candidate_columns", {})
-        if isinstance(payload.get("candidate_columns"), dict)
-        else {},
-        "candidate_tables": payload.get("candidate_tables", [])
-        if isinstance(payload.get("candidate_tables"), list)
-        else [],
-        "selected_table": selected_table,
-        "selected_columns": selected_columns,
-    }
-
-
-class VoiceUploadView(APIView):
-    """
-    Upload audio file and get transcription + generated SQL from Small Whisper.
-    
-    Manager only.
-    
-    ARCHITECTURAL SEPARATION:
-    - This endpoint (Main BI Backend) handles ALL authentication and user validation
-    - Small Whisper Backend (port 8001) is a STATELESS AI worker
-    - Small Whisper receives ONLY audio file, returns ONLY data (no user context)
-    - This endpoint ALWAYS returns a valid report_id (even for conversational questions)
-    """
-    permission_classes = [IsAuthenticated, IsManager]
-    parser_classes = [MultiPartParser, FormParser]
-    
-    def post(self, request):
-        try:
-            # Validate audio file
-            if 'audio' not in request.FILES:
-                return Response(
-                    {'success': False, 'error': 'No audio file provided'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            audio_file = request.FILES['audio']
-            workspace = get_user_workspace(request.user)
-            
-            if not workspace:
-                return Response(
-                    {'success': False, 'error': 'User must belong to a workspace'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            # Save audio file
-            audio_dir = f'media/workspaces/{workspace.id}/audio'
-            os.makedirs(audio_dir, exist_ok=True)
-            
-            # Generate unique filename
-            import uuid
-            filename = f"{uuid.uuid4()}_{audio_file.name}"
-            audio_path = os.path.join(audio_dir, filename)
-            
-            with open(audio_path, 'wb+') as destination:
-                for chunk in audio_file.chunks():
-                    destination.write(chunk)
-            
-            logger.info(f"Audio file saved: {audio_path}")
-            
-            # Call Small Whisper (STATELESS - no user context needed)
-            whisper_client = get_small_whisper_client()
-            whisper_result = whisper_client.process_audio(audio_file=audio_path)
-            
-            if not whisper_result['success']:
-                return Response(
-                    {
-                        'success': False,
-                        'error': f"Small Whisper error: {whisper_result.get('error')}"
-                    },
-                    status=status.HTTP_503_SERVICE_UNAVAILABLE
-                )
-            
-            # Extract question type and SQL
-            question_type = whisper_result.get('question_type', 'unknown')
-            sql = whisper_result.get('sql')
-            generated_sql = whisper_result.get('generated_sql') or sql
-            reviewed_sql = whisper_result.get('reviewed_sql') or sql
-            preprocessing_low = normalize_preprocessing_low(
-                whisper_result.get("preprocessing_low"),
-                fallback_text=whisper_result.get("text", ""),
-            )
-            preprocessing_high = normalize_preprocessing_high(
-                whisper_result.get("preprocessing_high"),
-                fallback_query=preprocessing_low.get("cleaned_text", whisper_result.get("text", "")),
-            )
-            pipeline_trace = normalize_pipeline_trace(whisper_result.get("pipeline_trace"))
-            
-            # ALWAYS create a report record, even for conversational questions
-            # This ensures we always return a valid report_id
-            report = VoiceReport.objects.create(
-                workspace=workspace,
-                created_by=request.user,
-                audio_file=audio_path,
-                transcription=whisper_result['text'],
-                intent_json=whisper_result.get('intent'),
-                generated_sql=generated_sql or '',  # Raw SQL from generation stage
-                final_sql=reviewed_sql or '',  # Reviewed/corrected SQL before execution
-                preprocessing_low=preprocessing_low,
-                preprocessing_high=preprocessing_high,
-                pipeline_trace=pipeline_trace,
-                status=(
-                    VoiceReport.STATUS_PENDING
-                    if (question_type == 'analytical' and sql)
-                    else VoiceReport.STATUS_UPLOADED
-                ),
-            )
-            report.ai_trace = build_report_ai_trace(report)
-            report.save(update_fields=['ai_trace', 'updated_at'])
-            
-            # Handle conversational questions (no SQL needed)
-            if question_type != 'analytical' or not sql:
-                logger.info(f"Conversational question detected: {whisper_result.get('message')}")
-                return Response({
-                    'success': True,
-                    'id': report.id,  # Always return valid report_id
-                    'report_id': report.id,  # For backward compatibility
-                    'transcription': whisper_result['text'],
-                    'question_type': question_type,
-                    'message': whisper_result.get('message', 'Question does not require data analysis'),
-                    'intent': whisper_result.get('intent'),
-                    'requires_sql': False,
-                    'preprocessing_low': preprocessing_low,
-                    'preprocessing_high': preprocessing_high,
-                    'pipeline_trace': pipeline_trace,
-                    'overall_status': whisper_result.get('overall_status'),
-                    'root_cause': whisper_result.get('root_cause'),
-                    'dagster_runtime': whisper_result.get('dagster_runtime'),
-                    'final_route': whisper_result.get('final_route'),
-                    'final_user_message': whisper_result.get('final_user_message'),
-                    'status': VoiceReport.STATUS_UPLOADED
-                })
-            
-            # TODO: Create history entry when ReportHistory model is added
-            # ReportHistory.objects.create(
-            #     report=report,
-            #     action='created',
-            #     performed_by=request.user,
-            #     changes={
-            #         'transcription': whisper_result['text'],
-            #         'sql': whisper_result['sql']
-            #     }
-            # )
-            
-            logger.info(f"Voice report created: {report.id}")
-
-            normalized_chart = normalize_chart_payload(whisper_result.get('chart'))
-            
-            return Response({
-                'success': True,
-                'id': report.id,  # Always return valid report_id
-                'report_id': report.id,  # For backward compatibility
-                'transcription': whisper_result['text'],
-                'question_type': question_type,
-                'intent': whisper_result.get('intent'),
-                'sql': sql,
-                'chart': normalized_chart,
-                'confidence': whisper_result.get('confidence'),
-                'message': 'Audio processed successfully. Ready to execute.',
-                'preprocessing_low': preprocessing_low,
-                'preprocessing_high': preprocessing_high,
-                'pipeline_trace': pipeline_trace,
-                'overall_status': whisper_result.get('overall_status'),
-                'root_cause': whisper_result.get('root_cause'),
-                'dagster_runtime': whisper_result.get('dagster_runtime'),
-                'final_route': whisper_result.get('final_route'),
-                'final_user_message': whisper_result.get('final_user_message'),
-                'status': VoiceReport.STATUS_PENDING
-            })
-        
-        except Exception as e:
-            logger.error(f"Error in VoiceUploadView: {e}", exc_info=True)
-            return Response(
-                {'success': False, 'error': str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-
-
-class QueryExecuteView(APIView):
-    """
-    Execute SQL query on ClickHouse and create Metabase visualization.
-    
-    Manager and Analyst can execute.
-    """
-    permission_classes = [IsAuthenticated]
-    
-    def post(self, request, report_id):
-        try:
-            # Validate report_id is not None/undefined
-            if report_id is None:
-                logger.error("QueryExecuteView called with None report_id")
-                return Response(
-                    {'success': False, 'error': 'Invalid report_id: report_id cannot be null or undefined'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            # Get report
-            workspace = get_user_workspace(request.user)
-            if not workspace:
-                return Response(
-                    {'success': False, 'error': 'User must belong to a workspace'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            report = get_object_or_404(
-                VoiceReport,
-                id=report_id,
-                workspace=workspace
-            )
-            
-            # Validate report has SQL to execute
-            if not report.final_sql or not report.final_sql.strip():
-                logger.warning(f"Report {report_id} has no SQL to execute")
-                return Response(
-                    {'success': False, 'error': 'This report does not contain a SQL query. It may be a conversational question.'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            # Validate permissions
-            if request.user.role not in ['manager', 'analyst']:
-                return Response(
-                    {'success': False, 'error': 'Permission denied'},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-            
-            # Get SQL (final_sql may be edited by analyst)
-            sql_to_execute = report.final_sql
-            
-            # Validate SQL with SQL Guard
-            guard = SQLGuard(
-                workspace_database=os.getenv('CLICKHOUSE_DATABASE', 'etl')
-            )
-            
-            is_valid, error_msg, clean_sql = guard.validate_and_sanitize(sql_to_execute)
-            
-            if not is_valid:
-                report.status = VoiceReport.STATUS_FAILED
-                report.error_message = f"SQL validation failed: {error_msg}"
-                report.save()
-                
-                return Response(
-                    {'success': False, 'error': error_msg},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            report.sql_validated = True
-            report.final_sql = clean_sql
-            report.status = VoiceReport.STATUS_PROCESSING
-            report.error_message = ''
-            report.save()
-            
-            # Execute on ClickHouse
-            
-            try:
-                executor = get_clickhouse_executor()
-                query_result = executor.execute_query(clean_sql)
-                
-                if not query_result['success']:
-                    report.status = VoiceReport.STATUS_FAILED
-                    report.error_message = query_result['error']
-                    report.save()
-                    
-                    logger.error(f"ClickHouse query failed for report {report.id}: {query_result['error']}")
-                    
-                    # Return 502 Bad Gateway for external service failures
-                    return Response(
-                        {
-                            'success': False,
-                            'error': 'Query execution failed',
-                            'details': query_result['error']
-                        },
-                        status=status.HTTP_502_BAD_GATEWAY
-                    )
-            except Exception as e:
-                report.status = VoiceReport.STATUS_FAILED
-                report.error_message = f"ClickHouse connection error: {str(e)}"
-                report.save()
-                
-                logger.error(f"ClickHouse connection error for report {report.id}: {e}", exc_info=True)
-                
-                # Return 502 for ClickHouse connectivity issues
-                return Response(
-                    {
-                        'success': False,
-                        'error': 'Cannot connect to data warehouse',
-                        'details': str(e)
-                    },
-                    status=status.HTTP_502_BAD_GATEWAY
-                )
-            
-            # Save query results
-            # ðŸ”’ NaN-SAFE: Apply sanitization before saving to PostgreSQL JSONField
-            # This is defense-in-depth - results are already sanitized in executor,
-            # but we sanitize again here to ensure PostgreSQL storage never fails
-            sanitized_rows = sanitize_query_results(query_result['rows'])
-            report.query_result = {
-                'columns': query_result.get('columns', []),
-                'rows': sanitized_rows
-            }
-            report.execution_time_ms = query_result['execution_time_ms']
-            report.row_count = query_result['row_count']
-            report.status = VoiceReport.STATUS_EXECUTED
-            logger.info(
-                "ClickHouse result ready for report %s: columns=%s row_count=%s",
-                report.id,
-                len(query_result.get('columns', [])),
-                query_result['row_count']
-            )
-            
-            # ðŸ”’ NaN-SAFE: Catch JSON serialization errors during save
-            # This is a final safety net in case any NaN/Infinity values slip through
-            try:
-                report.save()
-            except (ValueError, TypeError) as json_error:
-                # JSON serialization failed - likely NaN/Infinity in data
-                logger.error(f"JSON serialization error when saving report {report.id}: {json_error}")
-                logger.error(f"This indicates NaN/Infinity values weren't properly sanitized")
-                # Try one more sanitization pass and save again
-                sanitized_rows = sanitize_query_results(sanitized_rows)
-                report.query_result = {
-                    'columns': query_result.get('columns', []),
-                    'rows': sanitized_rows
-                }
-                try:
-                    report.save()
-                except Exception as final_error:
-                    # If it still fails after re-sanitization, return error
-                    report.status = VoiceReport.STATUS_FAILED
-                    report.error_message = f"Data serialization error: {str(final_error)}"
-                    report.save()
-                    return Response(
-                        {
-                            'success': False,
-                            'error': 'Failed to save query results: invalid numeric values detected',
-                            'details': str(final_error)
-                        },
-                        status=status.HTTP_500_INTERNAL_SERVER_ERROR
-                    )
-            
-            # Infer chart type
-            chart_type = self._infer_chart_type(
-                query_result['columns'],
-                query_result['rows'],
-                report.intent_json
-            )
-            report.chart_type = chart_type
-            chart_config = dict(report.chart_config) if isinstance(report.chart_config, dict) else {}
-            chart_config["selected_chart_type"] = chart_type
-            chart_config["chart_type"] = chart_type
-            chart_config["reason_chart_selected"] = "shape_and_intent_inference"
-            report.chart_config = chart_config
-            visualization_settings = self._build_visualization_settings(report, chart_type)
-            dimensions = visualization_settings.get("graph.dimensions", [])
-            metrics = visualization_settings.get("graph.metrics", [])
-            chart_config["x_axis"] = dimensions[0] if isinstance(dimensions, list) and dimensions else ""
-            chart_config["y_axis"] = metrics[0] if isinstance(metrics, list) and metrics else ""
-            report.chart_config = chart_config
-            
-            # Create Metabase question
-            metabase = get_metabase_service()
-            
-            if not metabase.authenticate():
-                return self._metabase_failure_response(
-                    report=report,
-                    chart_type=chart_type,
-                    row_count=query_result['row_count'],
-                    execution_time_ms=query_result['execution_time_ms'],
-                    failure_reason='authentication_failed',
-                    details=metabase.last_error,
-                    http_status=status.HTTP_502_BAD_GATEWAY
-                )
-            
-            # Create question in Metabase
-            metabase_display = to_metabase_display(chart_type)
-            logger.info(
-                "Metabase chart display selected: chart_type=%s metabase_display=%s",
-                chart_type,
-                metabase_display
-            )
-            question_id = metabase.create_question(
-                name=f"Voice Report #{report.id}: {report.transcription[:50]}",
-                sql=clean_sql,
-                visualization_settings=visualization_settings
-            )
-            
-            if not question_id:
-                return self._metabase_failure_response(
-                    report=report,
-                    chart_type=chart_type,
-                    row_count=query_result['row_count'],
-                    execution_time_ms=query_result['execution_time_ms'],
-                    failure_reason='question_creation_failed',
-                    details=metabase.last_error,
-                    http_status=status.HTTP_502_BAD_GATEWAY
-                )
-
-            report.metabase_question_id = question_id
-            report.save(update_fields=['metabase_question_id', 'updated_at'])
-            
-            # Enable embedding (best effort)
-            if not metabase.enable_question_embedding(question_id):
-                logger.warning(
-                    "Failed to enable embedding for Metabase question %s (report %s)",
-                    question_id,
-                    report.id
-                )
-            
-            # Get or create workspace dashboard
-            dashboard_id = self._get_or_create_dashboard(
-                report.workspace,
-                metabase
-            )
-            
-            if dashboard_id:
-                # Add to dashboard (best effort)
-                if metabase.add_question_to_dashboard(question_id, dashboard_id):
-                    report.metabase_dashboard_id = dashboard_id
-                else:
-                    logger.warning(
-                        "Failed to add question %s to dashboard %s for report %s",
-                        question_id,
-                        dashboard_id,
-                        report.id
-                    )
-            
-            # Generate a fresh embed URL (do not persist JWT token in DB).
-            embed_url = metabase.get_question_embed_url(question_id=question_id)
-            if not embed_url:
-                embed_error = metabase.last_error or 'unknown_error'
-                embed_status = (
-                    status.HTTP_500_INTERNAL_SERVER_ERROR
-                    if 'METABASE_SECRET_KEY' in embed_error
-                    else status.HTTP_502_BAD_GATEWAY
-                )
-                return self._metabase_failure_response(
-                    report=report,
-                    chart_type=chart_type,
-                    row_count=query_result['row_count'],
-                    execution_time_ms=query_result['execution_time_ms'],
-                    failure_reason='embed_generation_failed',
-                    details=embed_error,
-                    http_status=embed_status,
-                    clear_question=False
-                )
-            
-            # TODO: Save chart inference when ChartInference model is added
-            # ChartInference.objects.create(
-            #     report=report,
-            #     inferred_type=chart_type,
-            #     column_analysis={
-            #         'columns': query_result['columns'],
-            #         'row_count': query_result['row_count']
-            #     },
-            #     confidence_score=0.85
-            # )
-            
-            report.chart_type = chart_type
-            chart_config["metabase"] = {
-                "question_id": question_id,
-                "dashboard_id": report.metabase_dashboard_id,
-                "display": getattr(metabase, "last_display", None) or metabase_display,
-                "fallback_applied": bool(getattr(metabase, "last_fallback_applied", False)),
-                "fallback_reason": getattr(metabase, "last_fallback_reason", ""),
-            }
-            report.chart_config = chart_config
-            report.status = VoiceReport.STATUS_VISUALIZATION_CREATED
-            report.error_message = ''
-            report.embed_url = ''
-            report.save()
-            
-            # TODO: Create history entry when ReportHistory model is added
-            # ReportHistory.objects.create(
-            #     report=report,
-            #     action='executed',
-            #     performed_by=request.user,
-            #     changes={
-            #         'row_count': query_result['row_count'],
-            #         'execution_time_ms': query_result['execution_time_ms'],
-            #         'chart_type': chart_type
-            #     }
-            # )
-            
-            logger.info(f"Report {report.id} executed successfully")
-            
-            return Response({
-                'success': True,
-                'report_id': report.id,
-                'row_count': query_result['row_count'],
-                'execution_time_ms': query_result['execution_time_ms'],
-                'chart_type': chart_type,
-                'status': report.status,
-                'embed_url': embed_url,
-                'metabase_question_id': question_id
-            })
-        
-        except Exception as e:
-            logger.error(f"Error in QueryExecuteView: {e}", exc_info=True)
-            return Response(
-                {'success': False, 'error': str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-
-    def _metabase_failure_response(
-        self,
-        *,
-        report,
-        chart_type,
-        row_count,
-        execution_time_ms,
-        failure_reason,
-        http_status,
-        details=None,
-        clear_question=True
-    ):
-        """Persist visualization failure and return a structured API error."""
-        logger.error(
-            "Metabase visualization failed for report %s: reason=%s details=%s",
-            report.id,
-            failure_reason,
-            details
-        )
-        report.status = VoiceReport.STATUS_FAILED
-        report.error_message = (
-            f"metabase_visualization_failed: {failure_reason}"
-            if not details
-            else f"metabase_visualization_failed: {failure_reason} ({details})"
-        )
-        report.embed_url = ''
-        if clear_question:
-            report.metabase_question_id = None
-            report.metabase_dashboard_id = None
-        report.save()
-
-        response_payload = {
-            'success': False,
-            'error': 'metabase_visualization_failed',
-            'report_id': report.id,
-            'row_count': row_count,
-            'execution_time_ms': execution_time_ms,
-            'chart_type': chart_type,
+            "intent": report.intent_json,
+            "generated_sql": report.generated_sql,
+            "final_sql": report.final_sql,
+            "sql_validated": report.sql_validated,
+            "sql_edited": report.sql_edited,
+            "query_result": report.query_result,
+            "preprocessing_low": report.preprocessing_low,
+            "preprocessing_high": report.preprocessing_high,
+            "pipeline_trace": report.pipeline_trace,
+            "ai_trace": report.ai_trace,
+            "error_message": report.error_message,
+            "edited_by": getattr(report.edited_by, "email", None) if report.edited_by else None,
+            "chart_config": report.chart_config,
         }
-        if details:
-            response_payload['details'] = details
-
-        return Response(response_payload, status=http_status)
-    
-    def _infer_chart_type(self, columns, rows, intent):
-        """Infer render-safe chart type from result shape using canonical chart labels."""
-        normalized_chart_type = infer_chart_type(
-            columns=columns if isinstance(columns, list) else [],
-            rows=rows if isinstance(rows, list) else [],
-            intent=intent if isinstance(intent, dict) else {},
-        )
-        logger.info(
-            "chart_selected=%s fallback_applied=%s",
-            normalized_chart_type,
-            normalized_chart_type == ChartType.TABLE,
-        )
-        return normalized_chart_type
-
-    def _build_visualization_settings(self, report, chart_type):
-        query_result = report.query_result if isinstance(report.query_result, dict) else {}
-        columns_payload = query_result.get("columns", []) if isinstance(query_result.get("columns", []), list) else []
-        rows_payload = query_result.get("rows", []) if isinstance(query_result.get("rows", []), list) else []
-        shape = profile_result_shape(columns_payload, rows_payload)
-        chart_config = report.chart_config if isinstance(report.chart_config, dict) else {}
-        normalized_chart_type = normalize_chart_type(chart_type, default=ChartType.TABLE)
-        display = to_metabase_display(normalized_chart_type)
-
-        column_specs = []
-        for column in columns_payload:
-            if isinstance(column, dict):
-                name = str(column.get("name", "")).strip()
-                col_type = str(column.get("type", "")).strip()
-            else:
-                name = str(column or "").strip()
-                col_type = ""
-            if name:
-                column_specs.append({"name": name, "type": col_type})
-
-        settings = {
-            "display": display,
-            "chart_type": normalized_chart_type,
-            "numeric_columns": shape.get("numeric_columns", []),
-            "time_columns": shape.get("time_like_columns", []),
-            "category_columns": [
-                name for name in shape.get("columns", [])
-                if name not in shape.get("numeric_columns", [])
-            ],
-            "row_count": shape.get("row_count", 0),
-            "dataset_columns": column_specs,
-            "result_rows": [row for row in rows_payload[:100] if isinstance(row, dict)],
-            "reason_chart_selected": chart_config.get("reason_chart_selected", ""),
-        }
-
-        numeric_columns = settings["numeric_columns"]
-        time_columns = settings["time_columns"]
-        category_columns = settings["category_columns"]
-        if normalized_chart_type == ChartType.LINE and time_columns and numeric_columns:
-            settings["graph.dimensions"] = [time_columns[0]]
-            settings["graph.metrics"] = [numeric_columns[0]]
-        elif normalized_chart_type == ChartType.SCATTER and len(numeric_columns) >= 2:
-            settings["graph.dimensions"] = [numeric_columns[0]]
-            settings["graph.metrics"] = [numeric_columns[1]]
-        elif normalized_chart_type == ChartType.BAR and category_columns and numeric_columns:
-            settings["graph.dimensions"] = [category_columns[0]]
-            settings["graph.metrics"] = [numeric_columns[0]]
-        elif normalized_chart_type == ChartType.HISTOGRAM and numeric_columns:
-            settings["graph.metrics"] = [numeric_columns[0]]
-        elif normalized_chart_type == ChartType.CARD and numeric_columns:
-            settings["graph.metrics"] = [numeric_columns[0]]
-        return settings
-    
-    def _get_or_create_dashboard(self, workspace, metabase):
-        """Get or create Metabase dashboard for workspace."""
-        # Check if workspace already has a dashboard
-        existing_report = VoiceReport.objects.filter(
-            workspace=workspace,
-            metabase_dashboard_id__isnull=False
-        ).first()
-        
-        if existing_report:
-            return existing_report.metabase_dashboard_id
-        
-        # Create new dashboard
-        dashboard_id = metabase.create_dashboard(
-            name=f"Workspace {workspace.id} - Voice Reports",
-            description=f"Voice-driven reports for {workspace.name}"
-        )
-        
-        return dashboard_id
-
-
-class SQLEditView(APIView):
-    """
-    Edit SQL query (Analyst only).
-    """
-    permission_classes = [IsAuthenticated, IsAnalyst]
-    
-    def put(self, request, report_id):
-        try:
-            workspace = get_user_workspace(request.user)
-            if not workspace:
-                return Response(
-                    {'success': False, 'error': 'User must belong to a workspace'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            report = get_object_or_404(
-                VoiceReport,
-                id=report_id,
-                workspace=workspace
-            )
-            
-            new_sql = request.data.get('sql')
-            
-            if not new_sql:
-                return Response(
-                    {'success': False, 'error': 'SQL is required'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            # Validate new SQL
-            guard = SQLGuard(
-                workspace_database=os.getenv('CLICKHOUSE_DATABASE', 'default')
-            )
-            
-            is_valid, error_msg, clean_sql = guard.validate_and_sanitize(new_sql)
-            
-            if not is_valid:
-                return Response(
-                    {'success': False, 'error': error_msg},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            # Save old SQL for history
-            old_sql = report.final_sql
-            
-            # Update report
-            report.final_sql = clean_sql
-            report.sql_edited = True
-            report.edited_by = request.user
-            report.sql_validated = True
-            report.status = VoiceReport.STATUS_PENDING  # Needs re-execution
-            report.save()
-            
-            # TODO: Create history entry when ReportHistory model is added
-            # ReportHistory.objects.create(
-            #     report=report,
-            #     action='sql_edited',
-            #     performed_by=request.user,
-            #     changes={
-            #         'old_sql': old_sql,
-            #         'new_sql': clean_sql
-            #     }
-            # )
-            
-            logger.info(f"Report {report.id} SQL edited by analyst {request.user.email}")
-            
-            return Response({
-                'success': True,
-                'report_id': report.id,
-                'sql': clean_sql,
-                'message': 'SQL updated successfully. Ready to re-execute.'
-            })
-        
-        except Exception as e:
-            logger.error(f"Error in SQLEditView: {e}", exc_info=True)
-            return Response(
-                {'success': False, 'error': str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+    )
+    return payload
 
 
 class ReportListView(APIView):
-    """
-    List all reports for workspace.
-    """
+    """Read-only list of persisted reports for the user's workspace."""
+
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
-        try:
-            workspace = get_user_workspace(request.user)
-            if not workspace:
-                return Response(
-                    {'success': False, 'error': 'User must belong to a workspace'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            reports = VoiceReport.objects.filter(
-                workspace=workspace
-            ).order_by('-created_at')
-            
-            # Filter by role
-            if request.user.role == 'manager':
-                # Manager sees only their own reports
-                reports = reports.filter(created_by=request.user)
-            # Analyst and Executive see all workspace reports
-            
-            metabase = get_metabase_service()
-            data = []
-            for report in reports:
-                embed_url = get_report_embed_url(report, metabase_service=metabase)
-                ai_contract = extract_report_contract(report)
-                data.append({
-                    'id': report.id,
-                    'transcription': report.transcription,
-                    'status': report.status,
-                    'created_at': report.created_at,
-                    'created_by': report.created_by.email,
-                    'chart_type': report.chart_type,
-                    'row_count': report.row_count,
-                    'execution_time_ms': report.execution_time_ms,
-                    'sql': report.final_sql,
-                    'embed_url': embed_url,
-                    'metabase_question_id': report.metabase_question_id,
-                    'confidence': ai_contract.get('confidence'),
-                    'confidence_breakdown': ai_contract.get('confidence_breakdown'),
-                    'degraded': ai_contract.get('degraded'),
-                    'can_edit': request.user.role == 'analyst'
-                })
-            logger.info(
-                "Report list loaded for user=%s workspace=%s count=%s",
-                request.user.id,
-                workspace.id,
-                len(data)
-            )
-            
-            return Response({
-                'success': True,
-                'reports': data,
-                'count': len(data)
-            })
-        
-        except Exception as e:
-            logger.error(f"Error in ReportListView: {e}", exc_info=True)
+        workspace = _get_user_workspace(request.user)
+        if not workspace:
             return Response(
-                {'success': False, 'error': str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                {"success": False, "error": "User must belong to a workspace"},
+                status=status.HTTP_400_BAD_REQUEST,
             )
+
+        reports_qs = VoiceReport.objects.filter(workspace=workspace).order_by("-created_at")
+
+        if str(getattr(request.user, "role", "")).lower() == "manager":
+            reports_qs = reports_qs.filter(created_by=request.user)
+
+        data = [_serialize_report_summary(report) for report in reports_qs]
+        logger.info(
+            "report_list_loaded",
+            extra={
+                "user_id": request.user.id,
+                "workspace_id": workspace.id,
+                "count": len(data),
+            },
+        )
+        return Response({"success": True, "reports": data, "count": len(data)})
 
 
 class ReportDetailView(APIView):
-    """
-    Get detailed report information.
-    """
+    """Read-only detail of a single persisted report."""
+
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request, report_id):
-        try:
-            workspace = get_user_workspace(request.user)
-            if not workspace:
-                return Response(
-                    {'success': False, 'error': 'User must belong to a workspace'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            report = get_object_or_404(
-                VoiceReport,
-                id=report_id,
-                workspace=workspace
-            )
-            
-            # TODO: Get history when ReportHistory model is added
-            # history = ReportHistory.objects.filter(report=report).order_by('-timestamp')
-            # history_data = [{
-            #     'action': h.action,
-            #     'performed_by': h.performed_by.email,
-            #     'timestamp': h.timestamp,
-            #     'changes': h.changes
-            # } for h in history]
-            history_data = []  # Placeholder until ReportHistory is added
-            embed_url = get_report_embed_url(report)
-            preprocessing_low = normalize_preprocessing_low(
-                report.preprocessing_low,
-                fallback_text=report.transcription,
-            )
-            preprocessing_high = normalize_preprocessing_high(
-                report.preprocessing_high,
-                fallback_query=preprocessing_low.get("cleaned_text", report.transcription),
-            )
-            pipeline_trace = normalize_pipeline_trace(report.pipeline_trace)
-            ai_contract = extract_report_contract(report)
-            ai_trace = build_report_ai_trace(report, embed_url=embed_url)
-            if report.ai_trace != ai_trace:
-                report.ai_trace = ai_trace
-                report.save(update_fields=['ai_trace', 'updated_at'])
-            
-            return Response({
-                'success': True,
-                'report': {
-                    'id': report.id,
-                    'transcription': report.transcription,
-                    'intent': report.intent_json,
-                    'generated_sql': report.generated_sql,
-                    'final_sql': report.final_sql,
-                    'status': report.status,
-                    'sql_validated': report.sql_validated,
-                    'sql_edited': report.sql_edited,
-                    'query_result': report.query_result,
-                    'row_count': report.row_count,
-                    'execution_time_ms': report.execution_time_ms,
-                    'chart_type': report.chart_type,
-                    'metabase_question_id': report.metabase_question_id,
-                    'metabase_dashboard_id': report.metabase_dashboard_id,
-                    'embed_url': embed_url,
-                    'preprocessing_low': preprocessing_low,
-                    'preprocessing_high': preprocessing_high,
-                    'pipeline_trace': pipeline_trace,
-                    'ai_trace': ai_trace,
-                    'confidence': ai_contract.get('confidence'),
-                    'confidence_breakdown': ai_contract.get('confidence_breakdown'),
-                    'degraded': ai_contract.get('degraded'),
-                    'overall_status': pipeline_trace.get('overall_status'),
-                    'root_cause': pipeline_trace.get('root_cause'),
-                    'error_message': report.error_message,
-                    'created_at': report.created_at,
-                    'created_by': report.created_by.email,
-                    'edited_by': report.edited_by.email if report.edited_by else None,
-                    'history': history_data
-                }
-            })
-        
-        except Exception as e:
-            logger.error(f"Error in ReportDetailView: {e}", exc_info=True)
+        workspace = _get_user_workspace(request.user)
+        if not workspace:
             return Response(
-                {'success': False, 'error': str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                {"success": False, "error": "User must belong to a workspace"},
+                status=status.HTTP_400_BAD_REQUEST,
             )
-    
-    def delete(self, request, report_id):
-        """Delete report (Manager only)."""
-        if request.user.role != 'manager':
-            return Response(
-                {'success': False, 'error': 'Only managers can delete reports'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        
+
         try:
-            workspace = get_user_workspace(request.user)
-            if not workspace:
-                return Response(
-                    {'success': False, 'error': 'User must belong to a workspace'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            report = get_object_or_404(
-                VoiceReport,
-                id=report_id,
-                workspace=workspace,
-                created_by=request.user  # Can only delete own reports
-            )
-            
-            report.delete()
-            
-            logger.info(f"Report {report_id} deleted by {request.user.email}")
-            
-            return Response({
-                'success': True,
-                'message': 'Report deleted successfully'
-            })
-        
+            report = get_object_or_404(VoiceReport, id=report_id, workspace=workspace)
         except Http404:
             return Response(
-                {'success': False, 'error': 'Report not found'},
-                status=status.HTTP_404_NOT_FOUND
+                {"success": False, "error": "Report not found"},
+                status=status.HTTP_404_NOT_FOUND,
             )
-        except Exception as e:
-            logger.error(f"Error deleting report: {e}", exc_info=True)
+
+        return Response({"success": True, "report": _serialize_report_detail(report)})
+
+    def delete(self, request, report_id):
+        if str(getattr(request.user, "role", "")).lower() != "manager":
             return Response(
-                {'success': False, 'error': str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                {"success": False, "error": "Only managers can delete reports"},
+                status=status.HTTP_403_FORBIDDEN,
             )
 
+        workspace = _get_user_workspace(request.user)
+        if not workspace:
+            return Response(
+                {"success": False, "error": "User must belong to a workspace"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-class AITraceDetailView(APIView):
-    """
-    Analyst-facing explainability payload for the full AI pipeline.
-    """
-    permission_classes = [IsAuthenticated]
-
-    def get(self, request, report_id):
         try:
-            workspace = get_user_workspace(request.user)
-            if not workspace:
-                return Response(
-                    {'success': False, 'error': 'User must belong to a workspace'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
             report = get_object_or_404(
                 VoiceReport,
                 id=report_id,
-                workspace=workspace
-            )
-            embed_url = get_report_embed_url(report)
-            ai_trace = build_report_ai_trace(report, embed_url=embed_url)
-
-            if report.ai_trace != ai_trace:
-                report.ai_trace = ai_trace
-                report.save(update_fields=['ai_trace', 'updated_at'])
-
-            return Response({
-                'success': True,
-                'report_id': report.id,
-                'ai_trace': ai_trace,
-            })
-        except Exception as e:
-            logger.error("Error in AITraceDetailView: %s", e, exc_info=True)
-            return Response(
-                {'success': False, 'error': str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-
-
-class WorkspaceDashboardView(APIView):
-    """
-    Get workspace dashboard for embedded viewing (Executive).
-    """
-    permission_classes = [IsAuthenticated]
-    
-    def get(self, request):
-        try:
-            workspace = get_user_workspace(request.user)
-            if not workspace:
-                return Response(
-                    {'success': False, 'error': 'User must belong to a workspace'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            # Get dashboard ID from any report
-            report = VoiceReport.objects.filter(
                 workspace=workspace,
-                metabase_dashboard_id__isnull=False
-            ).first()
-            
-            if not report:
-                return Response({
-                    'success': False,
-                    'error': 'No dashboard available yet. Create some reports first.'
-                }, status=status.HTTP_404_NOT_FOUND)
-            
-            # Generate fresh JWT embed URL for dashboard.
-            metabase = get_metabase_service()
-            embed_url = metabase.get_dashboard_embed_url(
-                dashboard_id=report.metabase_dashboard_id
+                created_by=request.user,
             )
-            if not embed_url:
-                return Response({
-                    'success': False,
-                    'error': metabase.last_error or 'Failed to generate dashboard embed URL'
-                }, status=status.HTTP_502_BAD_GATEWAY)
-            
-            return Response({
-                'success': True,
-                'dashboard_url': embed_url,
-                'dashboard_id': report.metabase_dashboard_id
-            })
-        
-        except Exception as e:
-            logger.error(f"Error in WorkspaceDashboardView: {e}", exc_info=True)
+        except Http404:
             return Response(
-                {'success': False, 'error': str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                {"success": False, "error": "Report not found"},
+                status=status.HTTP_404_NOT_FOUND,
             )
+
+        report.delete()
+        logger.info("report_deleted", extra={"report_id": report_id, "user_id": request.user.id})
+        return Response({"success": True, "message": "Report deleted successfully"})
 
 
 class DashboardStatsView(APIView):
-    """
-    Return dashboard counters for the current user scope.
-    """
+    """Aggregate counters over the user's persisted reports (read-only)."""
+
     permission_classes = [IsAuthenticated]
 
     SUCCESS_STATUSES = (
         VoiceReport.STATUS_VISUALIZATION_CREATED,
         VoiceReport.STATUS_EXECUTED,
-        VoiceReport.STATUS_COMPLETED,  # legacy
+        VoiceReport.STATUS_COMPLETED,
     )
 
     PROCESSING_STATUSES = (
         VoiceReport.STATUS_PENDING,
         VoiceReport.STATUS_PROCESSING,
-        VoiceReport.STATUS_PENDING_EXECUTION,  # legacy
-        VoiceReport.STATUS_EXECUTING,  # legacy
+        VoiceReport.STATUS_PENDING_EXECUTION,
+        VoiceReport.STATUS_EXECUTING,
     )
 
     def get(self, request):
-        try:
-            workspace = get_user_workspace(request.user)
-            if not workspace:
-                return Response(
-                    {'success': False, 'error': 'User must belong to a workspace'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-            reports = VoiceReport.objects.filter(workspace=workspace)
-
-            # Preserve list visibility semantics:
-            # managers only see their own reports; others see workspace reports.
-            if request.user.role == 'manager':
-                reports = reports.filter(created_by=request.user)
-
-            total_reports = reports.count()
-            completed_reports = reports.filter(status__in=self.SUCCESS_STATUSES).count()
-            failed_reports = reports.filter(status=VoiceReport.STATUS_FAILED).count()
-            processing_reports = reports.filter(status__in=self.PROCESSING_STATUSES).count()
-            total_rows = reports.aggregate(
-                total_rows=Coalesce(Sum('row_count'), 0)
-            )['total_rows']
-
-            payload = {
-                'success': True,
-                'total_reports': total_reports,
-                'completed_reports': completed_reports,
-                'failed_reports': failed_reports,
-                'processing_reports': processing_reports,
-                'total_rows': int(total_rows or 0),
-            }
-            logger.info(
-                "Dashboard stats loaded for user=%s workspace=%s payload=%s",
-                request.user.id,
-                workspace.id,
-                payload
-            )
-            return Response(payload)
-        except Exception as e:
-            logger.error("Error in DashboardStatsView: %s", e, exc_info=True)
+        workspace = _get_user_workspace(request.user)
+        if not workspace:
             return Response(
-                {'success': False, 'error': str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                {"success": False, "error": "User must belong to a workspace"},
+                status=status.HTTP_400_BAD_REQUEST,
             )
+
+        reports = VoiceReport.objects.filter(workspace=workspace)
+        if str(getattr(request.user, "role", "")).lower() == "manager":
+            reports = reports.filter(created_by=request.user)
+
+        total_rows = reports.aggregate(total_rows=Coalesce(Sum("row_count"), 0))["total_rows"]
+        return Response(
+            {
+                "success": True,
+                "total_reports": reports.count(),
+                "completed_reports": reports.filter(status__in=self.SUCCESS_STATUSES).count(),
+                "failed_reports": reports.filter(status=VoiceReport.STATUS_FAILED).count(),
+                "processing_reports": reports.filter(status__in=self.PROCESSING_STATUSES).count(),
+                "total_rows": int(total_rows or 0),
+            }
+        )
 
 
 class HealthCheckView(APIView):
-    """
-    Health check for all services.
-    """
-    permission_classes = []  # Public endpoint
-    
-    def get(self, request):
-        """Check connectivity to Small Whisper, ClickHouse, and Metabase."""
-        health = {
-            'small_whisper': False,
-            'clickhouse': False,
-            'metabase': False
-        }
-        
-        # Check Small Whisper
-        try:
-            whisper_client = get_small_whisper_client()
-            response = requests.get(f"{whisper_client.base_url}/health/", timeout=5)
-            health['small_whisper'] = response.status_code == 200
-        except:
-            pass
-        
-        # Check ClickHouse
-        try:
-            executor = get_clickhouse_executor()
-            health['clickhouse'] = executor.test_connection()
-        except:
-            pass
-        
-        # Check Metabase
-        try:
-            metabase = get_metabase_service()
-            health['metabase'] = metabase.authenticate()
-        except:
-            pass
-        
-        all_healthy = all(health.values())
-        
-        return Response({
-            'success': all_healthy,
-            'services': health,
-            'message': 'All services healthy' if all_healthy else 'Some services unavailable'
-        }, status=status.HTTP_200_OK if all_healthy else status.HTTP_503_SERVICE_UNAVAILABLE)
+    """Lightweight health probe for report-service itself only.
 
+    Cross-service health probing was removed: it caused report-service to
+    masquerade as the orchestration service. Each downstream service now
+    exposes its own health endpoint and is probed via the gateway.
+    """
+
+    permission_classes = []
+
+    def get(self, request):
+        return Response({"success": True, "service": "report-service", "status": "healthy"})
